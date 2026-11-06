@@ -6,9 +6,9 @@
  *      拉取其中的「免费节点」清单（result.csv：IP / 端口 / 带宽 / 延迟 / 地区）。
  *   2. 按「带宽大 + 延迟低」综合评分，每个地区只保留评分最高的 PER_REGION 个节点。
  *   3. 生成两份 Clash 订阅：
- *        /<密码>/cfw  →  Clash for Windows（老内核不支持 VLESS，这里用 VMess + WS + TLS）
+ *        /<密码>/trojan  →  Trojan（CFW / Verge 老内核都支持）
  *        /<密码>/cv   →  Clash Verge / Mihomo（VLESS + WS + TLS）
- *   4. 同一个 Worker 同时是代理服务端，VLESS / VMess 共用 UUID，路径 /?ed=2560。
+ *   4. 同一个 Worker 同时是代理服务端，VLESS / Trojan 共用 UUID，路径 /?ed=2560。
  *   5. 订阅响应带 subscription-userinfo：已用 114 T / 总量 514 T，到期 = 当前时间 + 1 天
  *      （客户端里的「流量 / 剩余时间」就来自这里，每次请求都会重新计算）。
  *
@@ -42,7 +42,7 @@ import { connect } from 'cloudflare:sockets';
 // 面板 / 订阅路径里的密码：只有 /<PASSWORD>/... 能访问（写死在这里即可）
 const PASSWORD = 'cfnode2026';
 
-// VLESS 与 VMess 共用的 UUID（可在 Pages 环境变量里用 uuid 覆盖）
+// VLESS / Trojan 共用的 UUID（可在 Pages 环境变量里用 uuid 覆盖）
 const UUID = 'e921a2ec-2c5c-4987-a303-35984326d3d7';
 
 // 节点数据源 = url.txt 里的项目地址（支持 GitHub 仓库、raw 地址、或任意 CSV/TXT 地址）
@@ -75,7 +75,7 @@ const TRAFFIC_USED_BYTES = 114 * 1024 ** 4;
 const TRAFFIC_TOTAL_BYTES = 514 * 1024 ** 4;
 const EXPIRE_SECONDS = 24 * 3600;
 
-// Trojan 口令（Trojan 订阅与 VMess / VLESS 共用同一批优选 IP，只是协议不同）
+// Trojan 口令（与 VLESS 共用同一批优选 IP，只是协议不同）
 const TROJAN_PASSWORD = 'cfnode-trojan-2026';
 
 // 访问 x.com / twitter.com 这类「Cloudflare 托管站点」的中转（proxyip）。
@@ -102,6 +102,8 @@ const SOURCE_TIMEOUT = 12000;
 // 到底是「IP 不行」还是「Worker 本身不行」。
 const INCLUDE_HOST_NODES = true;
 const HOST_PORTS = [443, 8443, 2053, 2083];
+// 明文端口：省掉 TLS 握手（Clash 每次测速都会重建连接，握手占大头）
+const HOST_PORTS_PLAIN = [80, 8080];
 
 // 0 号节点：沿用旧项目里的 visa 优选域名（域名:端口），标 0 号单独成组
 const INCLUDE_VISA_NODES = true;
@@ -184,7 +186,7 @@ export default {
     const url = new URL(request.url);
     const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
 
-    // 代理流量：VLESS / VMess 都走同一条 WebSocket
+    // 代理流量：VLESS / Trojan 都走同一条 WebSocket
     if (upgrade === 'websocket') {
       try {
         return await handleProxyWebSocket(request);
@@ -202,7 +204,7 @@ export default {
       if (pathname === base + '/' || pathname === base + '/index.html') {
         return await handlePanel(request);
       }
-      if (pathname === base + '/vmess' || pathname === base + '/cfw') return await handleSubscription(request, 'vmess');
+      if (pathname === base + '/cfw') return await handleSubscription(request, 'trojan'); // 老链接兼容
       if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless');
       if (pathname === base + '/trojan') return await handleSubscription(request, 'trojan');
       if (pathname === base + '/selftest') return await handleSelftest(request);
@@ -221,7 +223,7 @@ export default {
 };
 
 /* ------------------------------------------------------------------
- * 协议探测：同一入口同时接受 VLESS 与 VMess
+ * 协议探测：同一入口同时接受 VLESS 与 Trojan
  * ------------------------------------------------------------------ */
 
 function concatBytes(...parts) {
@@ -333,310 +335,6 @@ function closeAfterSend(ws, code, reason) {
   }, 30);
 }
 
-const uuidBytes = (uuid) => {
-  const hex = String(uuid).replace(/-/g, '');
-  const bytes = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return bytes;
-};
-
-// VMess 的 cmdKey 并非 UUID 本身，而是 UUID 拼接固定串后的 MD5
-const vmessCmdKey = (uuid) => md5(concatBytes(uuidBytes(uuid), textEncoder.encode('c48619fe-8f02-49e0-b9e9-edf763e17e21')));
-
-const sha256Bytes = async (data) => new Uint8Array(await crypto.subtle.digest('SHA-256', data));
-
-async function hmacWith(hashFn, key, message) {
-  const blockSize = 64;
-  let normalized = key;
-  if (normalized.length > blockSize) normalized = await hashFn(normalized);
-  const inner = new Uint8Array(blockSize).fill(0x36);
-  const outer = new Uint8Array(blockSize).fill(0x5c);
-  for (let i = 0; i < normalized.length; i++) {
-    inner[i] ^= normalized[i];
-    outer[i] ^= normalized[i];
-  }
-  const innerDigest = await hashFn(concatBytes(inner, message));
-  return hashFn(concatBytes(outer, innerDigest));
-}
-
-// VMess 的 KDF 是逐层嵌套的 HMAC-SHA256，底层哈希会被上一层 HMAC 替换
-async function vmessKdf(key, ...paths) {
-  let hashFn = (message) => hmacWith(sha256Bytes, textEncoder.encode('VMess AEAD KDF'), message);
-  for (const path of paths) {
-    const previous = hashFn;
-    const encoded = typeof path === 'string' ? textEncoder.encode(path) : path;
-    hashFn = (message) => hmacWith(previous, encoded, message);
-  }
-  return hashFn(key);
-}
-
-const vmessKdf16 = async (key, ...paths) => (await vmessKdf(key, ...paths)).subarray(0, 16);
-
-async function aesGcmDecrypt(key, iv, ciphertext, tag, aad) {
-  const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['decrypt']);
-  const params = { name: 'AES-GCM', iv, tagLength: 128 };
-  if (aad) params.additionalData = aad;
-  return new Uint8Array(await crypto.subtle.decrypt(params, cryptoKey, concatBytes(ciphertext, tag)));
-}
-
-async function aesGcmEncrypt(key, iv, plaintext, aad) {
-  const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['encrypt']);
-  const params = { name: 'AES-GCM', iv, tagLength: 128 };
-  if (aad) params.additionalData = aad;
-  return new Uint8Array(await crypto.subtle.encrypt(params, cryptoKey, plaintext));
-}
-
-const gfMultiply = (a, b) => {
-  let product = 0;
-  for (let i = 0; i < 8; i++) {
-    if (b & 1) product ^= a;
-    const high = a & 0x80;
-    a = (a << 1) & 0xff;
-    if (high) a ^= 0x1b;
-    b >>= 1;
-  }
-  return product;
-};
-
-const AES_SBOX = (() => {
-  const box = new Uint8Array(256);
-  for (let i = 0; i < 256; i++) {
-    let inverse = 1;
-    let base = i;
-    let power = 254;
-    while (power) {
-      if (power & 1) inverse = gfMultiply(inverse, base);
-      base = gfMultiply(base, base);
-      power >>= 1;
-    }
-    if (i === 0) inverse = 0;
-    let value = 0;
-    for (let bit = 0; bit < 8; bit++) {
-      const mixed = ((inverse >> bit) ^ (inverse >> ((bit + 4) % 8)) ^ (inverse >> ((bit + 5) % 8)) ^ (inverse >> ((bit + 6) % 8)) ^ (inverse >> ((bit + 7) % 8))) & 1;
-      value |= mixed << bit;
-    }
-    box[i] = value ^ 0x63;
-  }
-  return box;
-})();
-
-const AES_INV_SBOX = (() => {
-  const box = new Uint8Array(256);
-  for (let i = 0; i < 256; i++) box[AES_SBOX[i]] = i;
-  return box;
-})();
-
-function aesExpandKey(key) {
-  const words = new Uint32Array(44);
-  for (let i = 0; i < 4; i++) words[i] = (key[i * 4] << 24) | (key[i * 4 + 1] << 16) | (key[i * 4 + 2] << 8) | key[i * 4 + 3];
-  let rcon = 1;
-  for (let i = 4; i < 44; i++) {
-    let temp = words[i - 1];
-    if (i % 4 === 0) {
-      temp = ((temp << 8) | (temp >>> 24)) >>> 0;
-      temp = ((AES_SBOX[(temp >>> 24) & 0xff] << 24) | (AES_SBOX[(temp >>> 16) & 0xff] << 16) | (AES_SBOX[(temp >>> 8) & 0xff] << 8) | AES_SBOX[temp & 0xff]) >>> 0;
-      temp = (temp ^ (rcon << 24)) >>> 0;
-      rcon = gfMultiply(rcon, 2);
-    }
-    words[i] = (words[i - 4] ^ temp) >>> 0;
-  }
-  return words;
-}
-
-// WebCrypto 的 AES-CBC 会做 PKCS#7 去填充，等价不了 ECB，这里直接算逆密码
-function aesDecryptBlock(key, input) {
-  const words = aesExpandKey(key);
-  const state = new Uint8Array(input);
-
-  const addRoundKey = (round) => {
-    for (let column = 0; column < 4; column++) {
-      const word = words[round * 4 + column];
-      state[4 * column] ^= (word >>> 24) & 0xff;
-      state[4 * column + 1] ^= (word >>> 16) & 0xff;
-      state[4 * column + 2] ^= (word >>> 8) & 0xff;
-      state[4 * column + 3] ^= word & 0xff;
-    }
-  };
-  const shiftRows = () => {
-    for (let row = 1; row < 4; row++) {
-      const values = [state[row], state[4 + row], state[8 + row], state[12 + row]];
-      for (let column = 0; column < 4; column++) state[4 * ((column + row) % 4) + row] = values[column];
-    }
-  };
-  const mixColumns = () => {
-    for (let column = 0; column < 4; column++) {
-      const a0 = state[4 * column], a1 = state[4 * column + 1], a2 = state[4 * column + 2], a3 = state[4 * column + 3];
-      state[4 * column] = gfMultiply(a0, 14) ^ gfMultiply(a1, 11) ^ gfMultiply(a2, 13) ^ gfMultiply(a3, 9);
-      state[4 * column + 1] = gfMultiply(a0, 9) ^ gfMultiply(a1, 14) ^ gfMultiply(a2, 11) ^ gfMultiply(a3, 13);
-      state[4 * column + 2] = gfMultiply(a0, 13) ^ gfMultiply(a1, 9) ^ gfMultiply(a2, 14) ^ gfMultiply(a3, 11);
-      state[4 * column + 3] = gfMultiply(a0, 11) ^ gfMultiply(a1, 13) ^ gfMultiply(a2, 9) ^ gfMultiply(a3, 14);
-    }
-  };
-
-  addRoundKey(10);
-  for (let round = 9; round >= 1; round--) {
-    shiftRows();
-    for (let i = 0; i < 16; i++) state[i] = AES_INV_SBOX[state[i]];
-    addRoundKey(round);
-    mixColumns();
-  }
-  shiftRows();
-  for (let i = 0; i < 16; i++) state[i] = AES_INV_SBOX[state[i]];
-  addRoundKey(0);
-  return state;
-}
-
-async function aesEcbDecryptBlock(key, block) {
-  return aesDecryptBlock(key, block);
-}
-
-async function vmessAuthCheck(authId, cmdKey) {
-  const decodeKey = await vmessKdf16(cmdKey, 'AES Auth ID Encryption');
-  let block;
-  try {
-    block = await aesEcbDecryptBlock(decodeKey, authId);
-  } catch (error) {
-    return false;
-  }
-  if (block.length !== 16) return false;
-  if (crc32(block.subarray(0, 12)) !== readUint32BE(block, 12)) return false;
-  const timestamp = readBigUint64BE(block, 0);
-  return Math.abs(timestamp - Math.floor(Date.now() / 1000)) <= 120;
-}
-
-async function vmessOpenHeader(buffer, cmdKey) {
-  if (buffer.length < 42) return null;
-  const authId = buffer.subarray(0, 16);
-  const lengthCipher = buffer.subarray(16, 18);
-  const lengthTag = buffer.subarray(18, 34);
-  const nonce = buffer.subarray(34, 42);
-
-  const lengthKey = await vmessKdf16(cmdKey, 'VMess Header AEAD Key_Length', authId, nonce);
-  const lengthIv = (await vmessKdf(cmdKey, 'VMess Header AEAD Nonce_Length', authId, nonce)).subarray(0, 12);
-
-  let lengthPlain;
-  try {
-    lengthPlain = await aesGcmDecrypt(lengthKey, lengthIv, lengthCipher, lengthTag, authId);
-  } catch (error) {
-    return { error: '头部长度解密失败' };
-  }
-
-  const payloadLength = (lengthPlain[0] << 8) | lengthPlain[1];
-  if (payloadLength < 45) return { error: '头部长度异常' };
-  const total = 42 + payloadLength + 16;
-  if (buffer.length < total) return null;
-
-  const payloadKey = await vmessKdf16(cmdKey, 'VMess Header AEAD Key', authId, nonce);
-  const payloadIv = (await vmessKdf(cmdKey, 'VMess Header AEAD Nonce', authId, nonce)).subarray(0, 12);
-
-  let header;
-  try {
-    header = await aesGcmDecrypt(payloadKey, payloadIv, buffer.subarray(42, 42 + payloadLength), buffer.subarray(42 + payloadLength, total), authId);
-  } catch (error) {
-    return { error: '头部解密失败' };
-  }
-
-  return { header, bodyStart: total };
-}
-
-function vmessParseRequest(header) {
-  if (header.length < 41 || header[0] !== 0x01) return null;
-  const request = {
-    iv: header.subarray(1, 17),
-    key: header.subarray(17, 33),
-    responseV: header[33],
-    option: header[34],
-    security: header[35] & 0x0f,
-    command: header[37],
-    port: (header[38] << 8) | header[39],
-  };
-
-  const addressType = header[40];
-  if (addressType === 0x01) {
-    request.address = Array.from(header.subarray(41, 45)).join('.');
-  } else if (addressType === 0x02) {
-    const length = header[41];
-    request.address = new TextDecoder().decode(header.subarray(42, 42 + length));
-  } else if (addressType === 0x03) {
-    const parts = [];
-    for (let i = 0; i < 8; i++) parts.push(((header[41 + i * 2] << 8) | header[42 + i * 2]).toString(16));
-    request.address = parts.join(':');
-  } else {
-    return null;
-  }
-  return request;
-}
-
-async function vmessSession(request) {
-  const encKey = (await sha256Bytes(request.key)).subarray(0, 16);
-  const encIv = (await sha256Bytes(request.iv)).subarray(0, 16);
-  // security=2 是 auto，实际客户端按 AES-128-GCM 加密
-  const security = request.security === 2 ? 3 : request.security;
-  const session = {
-    security,
-    option: request.option,
-    responseV: request.responseV,
-    decKey: request.key,
-    decIv: request.iv,
-    decNonce: 0,
-    encKey,
-    encIv,
-    encNonce: 0,
-  };
-  if (security === 3) {
-    session.respLengthKey = await vmessKdf16(encKey, 'AEAD Resp Header Len Key');
-    session.respLengthIv = (await vmessKdf(encIv, 'AEAD Resp Header Len IV')).subarray(0, 12);
-    session.respKey = await vmessKdf16(encKey, 'AEAD Resp Header Key');
-    session.respIv = (await vmessKdf(encIv, 'AEAD Resp Header IV')).subarray(0, 12);
-  }
-  return session;
-}
-
-function vmessNonce(counter, iv) {
-  const nonce = new Uint8Array(12);
-  nonce[0] = (counter >> 8) & 0xff;
-  nonce[1] = counter & 0xff;
-  nonce.set(iv.subarray(2, 12), 2);
-  return nonce;
-}
-
-async function vmessDecryptChunk(session, payload) {
-  if (session.security !== 3) return payload;
-  if (payload.length < 16) return null;
-  const plain = await aesGcmDecrypt(
-    session.decKey,
-    vmessNonce(session.decNonce, session.decIv),
-    payload.subarray(0, payload.length - 16),
-    payload.subarray(payload.length - 16),
-    null
-  ).catch(() => null);
-  if (!plain) return null;
-  session.decNonce = (session.decNonce + 1) & 0xffff;
-  return plain;
-}
-
-async function vmessEncodeChunk(session, data) {
-  let body = data;
-  if (session.security === 3) {
-    body = await aesGcmEncrypt(session.encKey, vmessNonce(session.encNonce, session.encIv), data, null);
-    session.encNonce = (session.encNonce + 1) & 0xffff;
-  }
-  if (session.option < 1) return body;
-  const frame = new Uint8Array(2 + body.length);
-  frame[0] = (body.length >> 8) & 0xff;
-  frame[1] = body.length & 0xff;
-  frame.set(body, 2);
-  return frame;
-}
-
-async function vmessResponseHeader(session) {
-  const payload = new Uint8Array([session.responseV, 0, 0, 0]);
-  if (session.security !== 3) return payload;
-  const lengthBlock = await aesGcmEncrypt(session.respLengthKey, session.respLengthIv, new Uint8Array([0, 4]), null);
-  const payloadBlock = await aesGcmEncrypt(session.respKey, session.respIv, payload, null);
-  return concatBytes(lengthBlock, payloadBlock);
-}
-
 const isIPv4 = (value) => /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
 
 function toNat64(ipv4) {
@@ -667,27 +365,6 @@ async function connectTarget(address, port) {
 function isNormalClose(error) {
   const text = `${(error && error.name) || ''} ${(error && error.message) || ''}`;
   return /abort|closed|close|disconnect|network connection lost/i.test(text);
-}
-
-async function pipeVmessRemote(remote, ws, session) {
-  const reader = remote.readable.getReader();
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (ws.readyState !== WS_READY_STATE_OPEN) break;
-      const data = toBytes(value);
-      for (let offset = 0; offset < data.length; offset += 0x3fff) {
-        ws.send(await vmessEncodeChunk(session, data.subarray(offset, offset + 0x3fff)));
-      }
-    }
-    if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1000, '正常关闭');
-  } catch (error) {
-    if (!isNormalClose(error)) console.error('VMess 转发错误:', error);
-    closeSocket(remote);
-  } finally {
-    try { reader.releaseLock(); } catch (error) {}
-  }
 }
 
 function toBytes(data) {
@@ -878,14 +555,14 @@ function detectProtocol(bytes) {
   if (!bytes.length) return '';
   if (bytes[0] === 0x00) {
     if (bytes.length < 17) return '';
-    return formatUUID(bytes.subarray(1, 17)) === userID ? 'vless' : 'vmess';
+    return formatUUID(bytes.subarray(1, 17)) === userID ? 'vless' : 'unknown';
   }
   // Trojan：56 字节 hex(SHA224(口令))，可能还没收全
   const slice = bytes.subarray(0, Math.min(56, bytes.length));
   let prefix = '';
   for (let i = 0; i < slice.length; i += 1) prefix += String.fromCharCode(slice[i]);
-  if (slice.length < 56) return trojanHash.startsWith(prefix) ? '' : 'vmess';
-  return prefix === trojanHash ? 'trojan' : 'vmess';
+  if (slice.length < 56) return trojanHash.startsWith(prefix) ? '' : 'unknown';
+  return prefix === trojanHash ? 'trojan' : 'unknown';
 }
 
 function connectWithTimeout(options, ms = 15000) {
@@ -942,9 +619,12 @@ async function handleProxyWebSocket(request) {
 
     const buffered = pending;
     pending = new Uint8Array(0);
-    session = protocol === 'vmess'
-      ? createVmessSession(serverWS)
-      : (protocol === 'trojan' ? createTrojanSession(serverWS) : createVlessSession(serverWS));
+    if (protocol === 'unknown') {
+      closed = true;
+      try { serverWS.close(1002, '未知协议'); } catch (error) {}
+      return;
+    }
+    session = protocol === 'trojan' ? createTrojanSession(serverWS) : createVlessSession(serverWS);
     return session.feed(buffered);
   };
 
@@ -1178,189 +858,6 @@ function createVlessSession(serverWS) {
     }
   };
 }
-
-function createVmessSession(ws) {
-  const cmdKey = vmessCmdKey(userID);
-  let remote = null;
-  let currentRequest = null;
-  let awaitingFirstData = false;
-  let pipeEpoch = 0;
-  let session = null;
-  let buffered = new Uint8Array(0);
-  let waitingHeader = true;
-  let authenticated = false;
-  let firstUserData = true;
-
-  function shutdown(reason) {
-    closeSocket(remote);
-    try {
-      if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1011, reason);
-    } catch (error) {
-    }
-  }
-
-  async function feed(chunk) {
-    buffered = concatBytes(buffered, chunk);
-
-    if (waitingHeader) {
-      if (buffered.length < 16) return;
-      if (!authenticated) {
-        if (!(await vmessAuthCheck(buffered.subarray(0, 16), cmdKey))) {
-          shutdown('认证失败');
-          return;
-        }
-        authenticated = true;
-      }
-
-      const opened = await vmessOpenHeader(buffered, cmdKey);
-      if (!opened) return;
-      if (opened.error) {
-        shutdown(opened.error);
-        return;
-      }
-
-      const request = vmessParseRequest(opened.header);
-      if (!request) {
-        shutdown('请求头无效');
-        return;
-      }
-      if (request.command !== 0x01) {
-        shutdown('仅支持 TCP');
-        return;
-      }
-      if (request.option >= 0x05) {
-        shutdown('暂不支持分块掩码');
-        return;
-      }
-
-      session = await vmessSession(request);
-      buffered = buffered.subarray(opened.bodyStart);
-      waitingHeader = false;
-
-      // 首个数据帧可能就是延迟检测请求，先就地应答
-      let firstPayload = null;
-      if (session.option >= 1 && buffered.length >= 2) {
-        const length = (buffered[0] << 8) | buffered[1];
-        if (buffered.length >= 2 + length) {
-          firstPayload = await vmessDecryptChunk(session, buffered.subarray(2, 2 + length));
-          buffered = buffered.subarray(2 + length);
-          if (!firstPayload) {
-            shutdown('数据解密失败');
-            return;
-          }
-        }
-      }
-
-      if (firstPayload && isHealthCheckRequest(firstPayload)) {
-        if (ws.readyState === WS_READY_STATE_OPEN) {
-          ws.send(await vmessResponseHeader(session));
-          ws.send(await vmessEncodeChunk(session, HEALTH_CHECK_RESPONSE));
-          closeAfterSend(ws, 1000, '延迟检测');
-        }
-        return;
-      }
-
-      if (!firstPayload || !firstPayload.length) {
-        // 头部没带数据：等第一个数据帧再连，x.com 这类 CF 托管站点才能落到 proxyip
-        currentRequest = request;
-        awaitingFirstData = true;
-        return;
-      }
-
-      try {
-        remote = await openTarget(request.address, request.port, firstPayload);
-      } catch (error) {
-        shutdown('连接失败');
-        return;
-      }
-
-      if (ws.readyState === WS_READY_STATE_OPEN) ws.send(await vmessResponseHeader(session));
-      pipeVmessRemote(remote, ws, session);
-
-      if (firstPayload && firstPayload.length) firstUserData = false;
-    }
-
-    if (awaitingFirstData && currentRequest) {
-      if (session.option >= 1) {
-        if (buffered.length < 2) return;
-        const pendingLength = (buffered[0] << 8) | buffered[1];
-        if (buffered.length < 2 + pendingLength) return;
-        const firstPlain = await vmessDecryptChunk(session, buffered.subarray(2, 2 + pendingLength));
-        buffered = buffered.subarray(2 + pendingLength);
-        if (!firstPlain) {
-          shutdown('数据解密失败');
-          return;
-        }
-        awaitingFirstData = false;
-        if (isHealthCheckRequest(firstPlain)) {
-          if (ws.readyState === WS_READY_STATE_OPEN) {
-            ws.send(await vmessResponseHeader(session));
-            ws.send(await vmessEncodeChunk(session, HEALTH_CHECK_RESPONSE));
-            closeAfterSend(ws, 1000, '延迟检测');
-          }
-          return;
-        }
-        try {
-          remote = await openTarget(currentRequest.address, currentRequest.port, firstPlain);
-        } catch (error) {
-          shutdown('连接失败');
-          return;
-        }
-        if (ws.readyState === WS_READY_STATE_OPEN) ws.send(await vmessResponseHeader(session));
-        pipeVmessRemote(remote, ws, session);
-        firstUserData = false;
-        return;
-      }
-    }
-
-    if (session.option < 1) {
-      // 不分帧：整段即数据
-      if (buffered.length && remote) {
-        const writer = remote.writable.getWriter();
-        await writer.write(buffered);
-        writer.releaseLock();
-      }
-      buffered = new Uint8Array(0);
-      return;
-    }
-
-    while (buffered.length >= 2) {
-      const length = (buffered[0] << 8) | buffered[1];
-      if (buffered.length < 2 + length) break;
-      const plain = await vmessDecryptChunk(session, buffered.subarray(2, 2 + length));
-      buffered = buffered.subarray(2 + length);
-      if (!plain) {
-        shutdown('数据解密失败');
-        return;
-      }
-      if (firstUserData) {
-        firstUserData = false;
-        if (isHealthCheckRequest(plain)) {
-          closeSocket(remote);
-          remote = null;
-          if (ws.readyState === WS_READY_STATE_OPEN) {
-            ws.send(await vmessEncodeChunk(session, HEALTH_CHECK_RESPONSE));
-            closeAfterSend(ws, 1000, '延迟检测');
-          }
-          return;
-        }
-      }
-      if (plain.length && remote) {
-        const writer = remote.writable.getWriter();
-        await writer.write(plain);
-        writer.releaseLock();
-      }
-    }
-  }
-
-  return {
-    feed,
-    close() {
-      closeSocket(remote);
-    }
-  };
-}
-
 
 /* ------------------------------------------------------------------
  * Trojan：56 字节口令 + CRLF + CMD + ATYP + ADDR + PORT + CRLF + 数据
@@ -2025,14 +1522,16 @@ function selectNodes(entries, hostName) {
 // 自动优化线路：直接用部署域名连（CF 会把你带到最近的边缘节点），不依赖第三方优选 IP
 function buildHostNodes(hostName) {
   if (!INCLUDE_HOST_NODES) return [];
-  return HOST_PORTS.map((port) => ({
+  const ports = HOST_PORTS.map((port) => ({ port, tls: true }))
+    .concat(HOST_PORTS_PLAIN.map((port) => ({ port, tls: false })));
+  return ports.map(({ port, tls }) => ({
     name: '🇨🇳 自动优化线路·' + port,
     server: hostName,
     port,
     uuid: userID,
     host: hostName,
     path: WS_PATH,
-    tls: true,
+    tls,
     region: '自动优化线路',
     flag: '🇨🇳',
     country: 'CN',
@@ -2177,23 +1676,20 @@ dns:
 const quoteYaml = (value) => JSON.stringify(String(value));
 
 function yamlProxy(node, kind) {
-  const vmess = kind === 'vmess';
   const trojan = kind === 'trojan';
   const lines = [
     '- name: ' + quoteYaml(node.name),
-    '  type: ' + (vmess ? 'vmess' : (trojan ? 'trojan' : 'vless')),
+    '  type: ' + (trojan ? 'trojan' : 'vless'),
     '  server: ' + quoteYaml(node.server),
     '  port: ' + node.port,
     trojan ? '  password: ' + quoteYaml(TROJAN_PASSWORD) : '  uuid: ' + quoteYaml(node.uuid),
   ];
-  if (vmess) lines.push('  alterId: 0', '  cipher: aes-128-gcm');
   lines.push('  udp: false');
   lines.push('  tls: ' + (node.tls ? 'true' : 'false'));
   if (node.tls) lines.push((trojan ? '  sni: ' : '  servername: ') + quoteYaml(node.host));
   // WebSocket 走 TLS 时必须只用 http/1.1：协商到 h2 时 Upgrade 会被拒，表现为节点连不上
   if (node.tls) lines.push('  alpn:', '    - http/1.1');
-  if (vmess) lines.push('  skip-cert-verify: false');
-  else if (trojan) lines.push('  skip-cert-verify: false');
+  if (trojan) lines.push('  skip-cert-verify: false');
   else lines.push('  client-fingerprint: chrome');
   lines.push('  network: ws');
   lines.push(
@@ -2305,7 +1801,7 @@ function formatTraffic(bytes) {
   return (Number.isInteger(value) ? String(value) : value.toFixed(1)) + ' T';
 }
 
-function yamlDocument(context, kind) {
+function yamlDocument(context, kind, meta = false) {
   const { nodes, regions, sourceUrl, fetchedAt, stale } = context;
   const head = [
     '# Cloudflare Pages 自动生成 · ' + formatTime(fetchedAt),
@@ -2314,7 +1810,7 @@ function yamlDocument(context, kind) {
     '# 排序依据：带宽 + 延迟综合评分，同地区只保留评分最高的几个',
     '# 订阅流量 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / ' + formatTraffic(TRAFFIC_TOTAL_BYTES) +
       ' · 到期 ' + formatTime(context.expireAt * 1000),
-    '# 协议 ' + (kind === 'vmess' ? 'VMess + WS + TLS（Clash for Windows 可用）' : (kind === 'trojan' ? 'Trojan + WS + TLS（CFW / Verge 都可用）' : 'VLESS + WS + TLS（Clash Verge / Mihomo）')),
+    '# 协议 ' + (kind === 'trojan' ? 'Trojan + WS + TLS（CFW / Verge 都可用）' : 'VLESS + WS + TLS（Clash Verge / Mihomo）'),
     '',
   ];
 
@@ -2329,7 +1825,7 @@ function yamlDocument(context, kind) {
   ];
 
   return head.concat([
-    (kind === 'vless' ? CV_BASE : CFW_BASE).replace(/__HOST__/g, context.hostName),
+    (meta || kind === 'vless' ? CV_BASE : CFW_BASE).replace(/__HOST__/g, context.hostName),
     '',
     'proxies:',
     nodes.map((node) => yamlProxy(node, kind)).join('\n\n'),
@@ -2341,7 +1837,13 @@ function yamlDocument(context, kind) {
 
 async function handleSubscription(request, kind) {
   const context = await buildContext(request);
-  const body = yamlDocument(context, kind);
+  const url = new URL(request.url);
+  const ua = request.headers.get('user-agent') || '';
+  // Meta 内核支持 unified-delay（延迟显示会扣掉握手），老内核不支持
+  const meta = url.searchParams.has('meta')
+    ? url.searchParams.get('meta') !== '0'
+    : /mihomo|clash[-_ ]?verge|clash[-_. ]?meta|clashx|stash|flclash|meta/i.test(ua);
+  const body = yamlDocument(context, kind, meta);
   return new Response(body, {
     status: 200,
     headers: {
@@ -2474,7 +1976,6 @@ function renderPanel(context) {
   const base = 'https://' + hostName + '/' + PASSWORD;
   const sub = {
     trojan: base + '/trojan',
-    vmess: base + '/vmess',
     vless: base + '/vless',
   };
   const clashImport = (url) => 'clash://install-config?url=' + encodeURIComponent(url);
@@ -2534,7 +2035,7 @@ ${nodeRows}
   const notes = [
     '每次打开或刷新页面、每次客户端更新订阅，都会重新抓取数据源并重新挑选节点，不做任何缓存（上游失败时才会退回上一次成功的数据）。',
     '评分 = 带宽 50% + 延迟 50%；同一地区只保留评分最高的 ' + PER_REGION + ' 个，整个订阅最多 ' + MAX_NODES + ' 个。',
-    '三类协议共用同一批节点：/trojan（Trojan，CFW 与 Verge 都支持）、/vmess（Clash for Windows）、/vless（Clash Verge / Mihomo）；只有 VLESS 是 CFW 老内核不支持的。',
+    '两种协议共用同一批节点：/trojan（Trojan，CFW 与 Verge 老内核都支持）、/vless（Clash Verge / Mihomo）。',
     '访问 x.com / twitter.com 这类 Cloudflare 托管站点时会自动改走 proxyip 中转（Worker 的 connect() 不允许直连 CF 自己的 IP）；普通站点仍然直连，不绕路。',
     '订阅里固定带一个 🎯 100~200ms 的节点，方便对照测速。',
     '当前 Worker 同时是代理服务端，UUID 与面板密码都写死在代码里；转发落地依赖 Worker 的 NAT64 出口，无需设置 ProxyIP。',
@@ -2573,7 +2074,6 @@ ${nodeRows}
     <h2>订阅</h2>
     <div class="rows">
 ${subRow('Trojan（CFW / Verge 都支持）', 'Trojan · WS + TLS', sub.trojan)}
-${subRow('VMess（Clash for Windows）', 'VMess · WS + TLS', sub.vmess)}
 ${subRow('VLESS（Clash Verge / Mihomo）', 'VLESS · WS + TLS', sub.vless)}
     </div>
     <p class="hint">「打开 Clash 导入」会直接唤起已经安装的 Clash 客户端；没有反应时先点「复制订阅链接」，再到客户端里粘贴订阅地址。</p>

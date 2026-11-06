@@ -1,11 +1,10 @@
-# Cloudflare 免费节点订阅（Trojan / VMess / VLESS 三类订阅）
 
-一个单文件 Worker：**每次请求实时抓取优选 IP → 评分挑节点 → 生成三份 Clash 订阅**，同时它自己就是代理服务端。
+一个单文件 Worker：**每次请求实时抓取优选 IP → 评分挑节点 → 生成两份 Clash 订阅（Trojan / VLESS）**，同时它自己就是代理服务端。
 面板带密码保护，支持「一键唤起 Clash 导入」和「复制订阅链接」。
 
 - 文件：`_worker.js`（唯一文件，无依赖、无需构建）
 - 面板：`https://<你的域名>/<密码>/`（默认密码 `cfnode2026`）
-- 订阅：`/trojan`、`/vmess`、`/vless`（旧的 `/cfw` = vmess、`/cv` = vless 仍然可用）
+- 订阅：`/trojan`（CFW / Verge）、`/vless`（Verge / Mihomo）；`/cfw` 兼容指向 Trojan，`/cv` 兼容指向 VLESS
 - 版本：`V26.11.07`
 
 ---
@@ -16,7 +15,6 @@
 |---|---|
 | 免费节点来源 | 读取 `url.txt` 指向的项目（默认 `xgonce/Cloudflare_IP` 的 `result.csv`：IP / 端口 / 带宽 / 延迟 / 地区），每次请求重新拉取，不做缓存 |
 | 选点策略 | 带宽 + 延迟综合评分；每个地区保留评分最高的 4 个；额外固定一个 `🎯 100~200ms` 节点 |
-| 三类订阅 | Trojan、VMess、VLESS 共用同一批节点，只是协议不同（CFW 不支持 VLESS，用前两种） |
 | 自动优化线路 | 订阅里固定 `🇨🇳 自动优化线路·443/8443/2053/2083`：直接用部署域名连，Cloudflare 会把你带到最近的边缘节点，不依赖第三方优选 IP |
 | 访问推特 | 目标落在 Cloudflare 网段时（x.com / twitter.com），自动改走 proxyip 中转 |
 | 延迟检测 | Clash 的 `generate_204` 由 Worker 就地应答，不连上游，测出来就是纯 RTT |
@@ -65,7 +63,6 @@
 
 1. **Profiles** → 顶部输入框粘贴订阅地址 → **Download**：
    - 首选 Trojan：`https://<域名>/<密码>/trojan`
-   - 或 VMess：`https://<域名>/<密码>/vmess`
 2. 节点列表里先选 **`⚡ 低延迟`**、**`🇨🇳 自动优化线路`** 或 **`0️⃣ visa优化`**。
 3. 延迟测试走的是 `generate_204`，数字应该接近你到 Cloudflare 边缘的 RTT（国内常见 30–200ms）。
 
@@ -112,7 +109,6 @@
 | 常量 | 默认 | 作用 |
 |---|---|---|
 | `PASSWORD` | `cfnode2026` | 面板与订阅路径的密码 |
-| `UUID` | `e921a2ec-…` | VLESS / VMess 共用 UUID（可用环境变量 `uuid` 覆盖） |
 | `TROJAN_PASSWORD` | `cfnode-trojan-2026` | Trojan 口令 |
 | `NODE_SOURCES` | `https://github.com/xgonce/Cloudflare_IP` | 节点数据源；支持仓库地址、raw/CSV 直链、`ip:port` 文本 |
 | `PER_REGION` | `4` | 每个地区保留几个 |
