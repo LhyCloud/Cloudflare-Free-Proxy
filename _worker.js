@@ -1,341 +1,974 @@
-//nat64自动填充proxyip，无需且不支持proxyip设置
-import { connect } from "cloudflare:sockets";
+/**
+ * Cloudflare Pages · 单文件 Worker：免费节点订阅生成器（CFW / Clash Verge）
+ * ---------------------------------------------------------------------------
+ * 用途
+ *   1. 每次请求都会重新读取 url.txt 里的项目（NODE_SOURCES），
+ *      拉取其中的「免费节点」清单（result.csv：IP / 端口 / 带宽 / 延迟 / 地区）。
+ *   2. 按「带宽大 + 延迟低」综合评分，每个地区只保留评分最高的 PER_REGION 个节点。
+ *   3. 生成两份 Clash 订阅：
+ *        /<密码>/cfw  →  Clash for Windows（老内核不支持 VLESS，这里用 VMess + WS + TLS）
+ *        /<密码>/cv   →  Clash Verge / Mihomo（VLESS + WS + TLS）
+ *   4. 同一个 Worker 同时是代理服务端，VLESS / VMess 共用 UUID，路径 /?ed=2560。
+ *   5. 订阅响应带 subscription-userinfo：已用 114 T / 总量 514 T，到期 = 当前时间 + 1 天
+ *      （客户端里的「流量 / 剩余时间」就来自这里，每次请求都会重新计算）。
+ *
+ * 路由
+ *   /<密码>/          面板（打开 Clash 导入 / 复制订阅链接）
+ *   /<密码>/cfw       Clash for Windows 订阅（YAML）
+ *   /<密码>/cv        Clash Verge 订阅（YAML）
+ *   其它路径一律 404，不暴露面板。
+ *
+ * 部署（Cloudflare Pages · 高级模式）
+ *   把本文件命名为 _worker.js 放在 Pages 项目根目录（构建输出根目录）即可，
+ *   不需要打包，也不需要 functions 目录。
+ *
+ * 兼容性（踩过的坑，别改回去）
+ *   · 不使用 new ReadableStream({...}) / new WritableStream(...) / new TransformStream(...)，
+ *     这些构造函数依赖 streams_enable_constructors 兼容标记，而 Pages 页面里没有这个开关，
+ *     一旦缺失，WebSocket 建立数据流时就抛错 → 客户端表现为 502 / 连不上。
+ *   · serverWS.accept() 之后强制 binaryType = 'arraybuffer'，并额外兼容 Blob，
+ *     否则新兼容日期下 message 事件给的是 Blob，会被当成空数据 → 握手成功但一个字节都不通。
+ *   · 因此本文件在 Pages（任意兼容日期）和 Workers 上都能直接用。
+ *
+ * 只需要改下面「配置」区：PASSWORD（密码）、UUID（节点密钥）、NODE_SOURCES（url.txt 项目）。
+ */
+
+import { connect } from 'cloudflare:sockets';
+
+/* ==========================================================================
+ * 配置
+ * ========================================================================== */
+
+// 面板 / 订阅路径里的密码：只有 /<PASSWORD>/... 能访问（写死在这里即可）
+const PASSWORD = 'cfnode2026';
+
+// VLESS 与 VMess 共用的 UUID（可在 Pages 环境变量里用 uuid 覆盖）
+const UUID = 'e921a2ec-2c5c-4987-a303-35984326d3d7';
+
+// 节点数据源 = url.txt 里的项目地址（支持 GitHub 仓库、raw 地址、或任意 CSV/TXT 地址）
+const NODE_SOURCES = ['https://github.com/xgonce/Cloudflare_IP'];
+
+// 每个地区保留几个节点
+const PER_REGION = 4;
+
+// 生成的配置最多包含多少个节点
+const MAX_NODES = 160;
+
+// WebSocket 路径（与客户端配置一致）
+const WS_PATH = '/?ed=2560';
+
+// 可用于 TLS 的 Cloudflare 端口（不在列表里的端口按非 TLS 节点处理）
+const TLS_PORTS = new Set([443, 8443, 2053, 2083, 2087, 2096]);
+
+// 评分参数：带宽满分线（Mbps）、延迟满分线 / 归零线（ms）、可接受的最大延迟（ms）
+const SPEED_BENCH = 100;
+const LATENCY_FLOOR = 20;
+const LATENCY_CEIL = 400;
+const MAX_LATENCY = 600;
+
+// 客户端自动更新订阅的间隔（小时），通过 profile-update-interval 响应头下发
+const UPDATE_INTERVAL_HOURS = 6;
+
+// 订阅信息：客户端里显示的「已用 / 总量 / 到期」
+// 1 T = 1024^4 字节；到期时间每次请求都重新算，也就是永远显示「还有 1 天」
+const TRAFFIC_USED_BYTES = 114 * 1024 ** 4;
+const TRAFFIC_TOTAL_BYTES = 514 * 1024 ** 4;
+const EXPIRE_SECONDS = 24 * 3600;
+
+// Trojan 口令（Trojan 订阅与 VMess / VLESS 共用同一批优选 IP，只是协议不同）
+const TROJAN_PASSWORD = 'cfnode-trojan-2026';
+
+// 访问 x.com / twitter.com 这类「Cloudflare 托管站点」的中转（proxyip）。
+// Worker 的 connect() 不允许直连 Cloudflare 自己的 IP（会报 Stream was cancelled），
+// 所以先连到 proxyip，再把客户端原始字节（TLS ClientHello，SNI=目标域名）原样转发，
+// 由它按 SNI 送进 CF 边缘 —— 这就是 deploy-guide 里 v4.4 用的那套办法。
+const PROXYIPS = [
+  'proxyip.fxxk.dedyn.io:443',
+  'proxyip.us.fxxk.dedyn.io:443',
+  'cdn.xn--b6gac.eu.org:443',
+  'cf.090227.xyz:443',
+  'proxyip.aliyun.fxxk.dedyn.io:443',
+];
+
+// 订阅里保证至少有一个落在该延迟区间的节点（其余仍按评分挑）
+const TARGET_LATENCY_MIN = 100;
+const TARGET_LATENCY_MAX = 200;
+
+// 单个数据源请求超时（ms）
+const SOURCE_TIMEOUT = 12000;
+
+// 额外附带「本机域名」节点：用部署域名直连，不经过扫描出来的优选 IP。
+// 优选 IP 是第三方扫描结果，可能整批失效；留着这一组既能救急，也能用来判断
+// 到底是「IP 不行」还是「Worker 本身不行」。
+const INCLUDE_HOST_NODES = true;
+const HOST_PORTS = [443, 8443, 2053, 2083];
+
+// 0 号节点：沿用旧项目里的 visa 优选域名（域名:端口），标 0 号单独成组
+const INCLUDE_VISA_NODES = true;
+const VISA_NODES = [
+  ['www.visa.com.sg', 80],
+  ['cis.visa.com', 8080],
+  ['africa.visa.com', 8880],
+  ['www.visa.com.sg', 2052],
+  ['www.visaeurope.at', 2082],
+  ['www.visa.com.mt', 2086],
+  ['qa.visamiddleeast.com', 2095],
+  ['usa.visa.com', 443],
+  ['myanmar.visa.com', 8443],
+  ['www.visa.com.tw', 2053],
+  ['www.visaeurope.ch', 2083],
+  ['www.visa.com.br', 2087],
+  ['www.visasoutheasturope.com', 2096],
+];
+
+const PAGE_VERSION = 'V26.11.07';
+
+// 机房/城市代码 → 中文（没收录的保留原代码）
+const CITY_NAMES = {
+  LAX: '洛杉矶', SJC: '圣何塞', SEA: '西雅图', DFW: '达拉斯', ORD: '芝加哥', ATL: '亚特兰大',
+  IAD: '华盛顿', EWR: '纽瓦克', BOS: '波士顿', MIA: '迈阿密', SLC: '盐湖城', PHX: '凤凰城',
+  STL: '圣路易斯', MCI: '堪萨斯城', PIT: '匹兹堡', CMH: '哥伦布', DEN: '丹佛', LAS: '拉斯维加斯',
+  YYZ: '多伦多', YUL: '蒙特利尔', YVR: '温哥华', YYC: '卡尔加里',
+  AMS: '阿姆斯特丹', FRA: '法兰克福', CDG: '巴黎', LHR: '伦敦', MAD: '马德里', BCN: '巴塞罗那',
+  FCO: '罗马', MXP: '米兰', BER: '柏林', TXL: '柏林', MUC: '慕尼黑', HAM: '汉堡', DUS: '杜塞尔多夫',
+  VIE: '维也纳', ZRH: '苏黎世', GVA: '日内瓦', BRU: '布鲁塞尔', CPH: '哥本哈根', OSL: '奥斯陆',
+  ARN: '斯德哥尔摩', HEL: '赫尔辛基', RIX: '里加', TLL: '塔林', VNO: '维尔纽斯', WAW: '华沙',
+  PRG: '布拉格', BUD: '布达佩斯', OTP: '布加勒斯特', SOF: '索菲亚', ATH: '雅典', LIS: '里斯本',
+  DUB: '都伯林', EDI: '爱丁堡', ZAG: '萨格勒布', BEG: '贝尔格莱德', KBP: '基辅', LED: '圣彼得堡',
+  SVO: '莫斯科', DME: '莫斯科', IST: '伊斯坦布尔', TLV: '特拉维夫', DXB: '迪拜', DOH: '多哈',
+  RUH: '利雅得', JED: '吉达', DEL: '德里', BOM: '孟买', BLR: '班加罗尔', MAA: '金奈', CCU: '加尔各答',
+  BKK: '曼谷', SGN: '胡志明市', HAN: '河内', KUL: '吉隆坡', CGK: '雅加达', MNL: '马尼拉',
+  SIN: '新加坡', HKG: '香港', TPE: '台北', NRT: '东京', HND: '东京', KIX: '大阪', ICN: '首尔',
+  SYD: '悉尼', MEL: '墨尔本', AKL: '奥克兰', GRU: '圣保罗', EZE: '布宜诺斯艾利斯', SCL: '圣地亚哥',
+  MEX: '墨西哥城', BOG: '波哥大', LIM: '利马', JNB: '约翰内斯堡', CPT: '开普敦', LOS: '拉各斯',
+  NBO: '内罗毕', CAI: '开罗', LGW: '伦敦', LAX2: '洛杉矶',
+};
+// 地区中文名（没收录的国家直接显示两位国家代码）
+const REGION_NAMES = {
+  US: '美国', CA: '加拿大', MX: '墨西哥', BR: '巴西', AR: '阿根廷', CL: '智利',
+  GB: '英国', IE: '爱尔兰', DE: '德国', NL: '荷兰', FR: '法国', BE: '比利时',
+  CH: '瑞士', AT: '奥地利', IT: '意大利', ES: '西班牙', PT: '葡萄牙', PL: '波兰',
+  CZ: '捷克', SK: '斯洛伐克', HU: '匈牙利', RO: '罗马尼亚', BG: '保加利亚',
+  GR: '希腊', SE: '瑞典', NO: '挪威', DK: '丹麦', FI: '芬兰', IS: '冰岛',
+  LT: '立陶宛', LV: '拉脱维亚', EE: '爱沙尼亚', UA: '乌克兰', RU: '俄罗斯',
+  TR: '土耳其', IL: '以色列', AE: '阿联酋', SA: '沙特', QA: '卡塔尔',
+  IN: '印度', PK: '巴基斯坦', BD: '孟加拉', TH: '泰国', VN: '越南',
+  MY: '马来西亚', SG: '新加坡', ID: '印尼', PH: '菲律宾', HK: '香港',
+  TW: '台湾', MO: '澳门', CN: '中国', JP: '日本', KR: '韩国', AU: '澳大利亚',
+  NZ: '新西兰', ZA: '南非', EG: '埃及', NG: '尼日利亚', KE: '肯尼亚',
+  KZ: '哈萨克斯坦', AM: '亚美尼亚', GE: '格鲁吉亚', CY: '塞浦路斯', MT: '马耳他',
+  SI: '斯洛文尼亚', HR: '克罗地亚', RS: '塞尔维亚', MD: '摩尔多瓦', BY: '白俄罗斯',
+  ZZ: '未标注',
+};
+
 const WS_READY_STATE_OPEN = 1;
-let userID = "e921a2ec-2c5c-4987-a303-11454326d3d7";
-const cn_hostnames = [''];
-let CDNIP = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d\u002e\u0073\u0067'
-// http_ip
-let IP1 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d'
-let IP2 = '\u0063\u0069\u0073\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d'
-let IP3 = '\u0061\u0066\u0072\u0069\u0063\u0061\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d'
-let IP4 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d\u002e\u0073\u0067'
-let IP5 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u0065\u0075\u0072\u006f\u0070\u0065\u002e\u0061\u0074'
-let IP6 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d\u002e\u006d\u0074'
-let IP7 = '\u0071\u0061\u002e\u0076\u0069\u0073\u0061\u006d\u0069\u0064\u0064\u006c\u0065\u0065\u0061\u0073\u0074\u002e\u0063\u006f\u006d'
 
-// https_ip
-let IP8 = '\u0075\u0073\u0061\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d'
-let IP9 = '\u006d\u0079\u0061\u006e\u006d\u0061\u0072\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d'
-let IP10 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d\u002e\u0074\u0077'
-let IP11 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u0065\u0075\u0072\u006f\u0070\u0065\u002e\u0063\u0068'
-let IP12 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u002e\u0063\u006f\u006d\u002e\u0062\u0072'
-let IP13 = '\u0077\u0077\u0077\u002e\u0076\u0069\u0073\u0061\u0073\u006f\u0075\u0074\u0068\u0065\u0061\u0073\u0074\u0065\u0075\u0072\u006f\u0070\u0065\u002e\u0063\u006f\u006d'
+// 运行期状态：UUID 与「上一次成功抓到的数据」（上游挂了就拿它兜底）
+let userID = UUID;
+let lastSnapshot = null;
 
-// http_port
-let PT1 = '80'
-let PT2 = '8080'
-let PT3 = '8880'
-let PT4 = '2052'
-let PT5 = '2082'
-let PT6 = '2086'
-let PT7 = '2095'
-
-// https_port
-let PT8 = '443'
-let PT9 = '8443'
-let PT10 = '2053'
-let PT11 = '2083'
-let PT12 = '2087'
-let PT13 = '2096'
+/* ==========================================================================
+ * 入口路由
+ * ========================================================================== */
 
 export default {
   /**
-   * @param {any} request
-   * @param {{uuid: string, proxyip: string, cdnip: string, ip1: string, ip2: string, ip3: string, ip4: string, ip5: string, ip6: string, ip7: string, ip8: string, ip9: string, ip10: string, ip11: string, ip12: string, ip13: string, pt1: string, pt2: string, pt3: string, pt4: string, pt5: string, pt6: string, pt7: string, pt8: string, pt9: string, pt10: string, pt11: string, pt12: string, pt13: string}} env
+   * @param {Request} request
+   * @param {{uuid?: string, UUID?: string}} env
    * @param {any} ctx
    * @returns {Promise<Response>}
    */
   async fetch(request, env, ctx) {
-    try {
-      userID = env.uuid || userID;
-      CDNIP = env.cdnip || CDNIP;
-	  IP1 = env.ip1 || IP1;
-	  IP2 = env.ip2 || IP2;
-	  IP3 = env.ip3 || IP3;
-	  IP4 = env.ip4 || IP4;
-	  IP5 = env.ip5 || IP5;
-	  IP6 = env.ip6 || IP6;
-	  IP7 = env.ip7 || IP7;
-	  IP8 = env.ip8 || IP8;
-	  IP9 = env.ip9 || IP9;
-	  IP10 = env.ip10 || IP10;
-	  IP11 = env.ip11 || IP11;
-	  IP12 = env.ip12 || IP12;
-	  IP13 = env.ip13 || IP13;
-	  PT1 = env.pt1 || PT1;
-	  PT2 = env.pt2 || PT2;
-	  PT3 = env.pt3 || PT3;
-	  PT4 = env.pt4 || PT4;
-	  PT5 = env.pt5 || PT5;
-	  PT6 = env.pt6 || PT6;
-	  PT7 = env.pt7 || PT7;
-	  PT8 = env.pt8 || PT8;
-	  PT9 = env.pt9 || PT9;
-	  PT10 = env.pt10 || PT10;
-	  PT11 = env.pt11 || PT11;
-	  PT12 = env.pt12 || PT12;
-	  PT13 = env.pt13 || PT13;
-      const upgradeHeader = request.headers.get("Upgrade");
-      const url = new URL(request.url);
-      if (!upgradeHeader || upgradeHeader !== "websocket") {
-        const url = new URL(request.url);
-        switch (url.pathname) {
-          case `/${userID}`: {
-            const \u0076\u006c\u0065\u0073\u0073Config = get\u0076\u006c\u0065\u0073\u0073Config(userID, request.headers.get("Host"));
-            return new Response(`${\u0076\u006c\u0065\u0073\u0073Config}`, {
-              status: 200,
-              headers: {
-                "Content-Type": "text/html;charset=utf-8",
-              },
-            });
-          }
-		  case `/${userID}/ty`: {
-			const tyConfig = gettyConfig(userID, request.headers.get('Host'));
-			return new Response(`${tyConfig}`, {
-				status: 200,
-				headers: {
-					"Content-Type": "text/plain;charset=utf-8",
-				}
-			});
-		}
-		case `/${userID}/cl`: {
-			const clConfig = getclConfig(userID, request.headers.get('Host'));
-			return new Response(`${clConfig}`, {
-				status: 200,
-				headers: {
-					"Content-Type": "text/plain;charset=utf-8",
-				}
-			});
-		}
-		case `/${userID}/sb`: {
-			const sbConfig = getsbConfig(userID, request.headers.get('Host'));
-			return new Response(`${sbConfig}`, {
-				status: 200,
-				headers: {
-					"Content-Type": "application/json;charset=utf-8",
-				}
-			});
-		}
-		case `/${userID}/pty`: {
-			const ptyConfig = getptyConfig(userID, request.headers.get('Host'));
-			return new Response(`${ptyConfig}`, {
-				status: 200,
-				headers: {
-					"Content-Type": "text/plain;charset=utf-8",
-				}
-			});
-		}
-		case `/${userID}/pcl`: {
-			const pclConfig = getpclConfig(userID, request.headers.get('Host'));
-			return new Response(`${pclConfig}`, {
-				status: 200,
-				headers: {
-					"Content-Type": "text/plain;charset=utf-8",
-					"Subscription-Userinfo":
-        `upload=0; download=125344325566464; total=565148976676864; expire=${Math.floor(Date.now() / 1000) + 86400 * 365}`, 
-          "Content-Disposition": "attachment; filename=Cloudflare_Clash_vless.yaml"
-				}
-			});
-		}
-		case `/${userID}/psb`: {
-			const psbConfig = getpsbConfig(userID, request.headers.get('Host'));
-			return new Response(`${psbConfig}`, {
-				status: 200,
-				headers: {
-					"Content-Type": "application/json;charset=utf-8",
-				}
-			});
-		}
-          default:
-            // return new Response('Not found', { status: 404 });
-            // For any other path, reverse proxy to 'ramdom website' and return the original response, caching it in the process
-            if (cn_hostnames.includes('')) {
-            return new Response(JSON.stringify(request.cf, null, 4), {
-              status: 200,
-              headers: {
-                "Content-Type": "application/json;charset=utf-8",
-              },
-            });
-            }
-            const randomHostname = cn_hostnames[Math.floor(Math.random() * cn_hostnames.length)];
-            const newHeaders = new Headers(request.headers);
-            newHeaders.set("cf-connecting-ip", "1.2.3.4");
-            newHeaders.set("x-forwarded-for", "1.2.3.4");
-            newHeaders.set("x-real-ip", "1.2.3.4");
-            newHeaders.set("referer", "https://www.google.com/search?q=edtunnel");
-            // Use fetch to proxy the request to 15 different domains
-            const proxyUrl = "https://" + randomHostname + url.pathname + url.search;
-            let modifiedRequest = new Request(proxyUrl, {
-              method: request.method,
-              headers: newHeaders,
-              body: request.body,
-              redirect: "manual",
-            });
-            const proxyResponse = await fetch(modifiedRequest, { redirect: "manual" });
-            // Check for 302 or 301 redirect status and return an error response
-            if ([301, 302].includes(proxyResponse.status)) {
-              return new Response(`Redirects to ${randomHostname} are not allowed.`, {
-                status: 403,
-                statusText: "Forbidden",
-              });
-            }
-            // Return the response from the proxy server
-            return proxyResponse;
-        }
+    userID = (env && (env.uuid || env.UUID)) || UUID;
+
+    const url = new URL(request.url);
+    const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
+
+    // 代理流量：VLESS / VMess 都走同一条 WebSocket
+    if (upgrade === 'websocket') {
+      try {
+        return await handleProxyWebSocket(request);
+      } catch (error) {
+        return new Response('websocket error: ' + (error && error.message), { status: 500 });
       }
-      return await handle\u0076\u006c\u0065\u0073\u0073WebSocket(request);
-    } catch (err) {
-      /** @type {Error} */ let e = err;
-      return new Response(e.toString());
     }
+
+    const base = '/' + PASSWORD;
+    const pathname = url.pathname.replace(/\/{2,}/g, '/');
+
+    if (pathname === base) return Response.redirect(url.origin + base + '/', 301);
+
+    try {
+      if (pathname === base + '/' || pathname === base + '/index.html') {
+        return await handlePanel(request);
+      }
+      if (pathname === base + '/vmess' || pathname === base + '/cfw') return await handleSubscription(request, 'vmess');
+      if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless');
+      if (pathname === base + '/trojan') return await handleSubscription(request, 'trojan');
+      if (pathname === base + '/selftest') return await handleSelftest(request);
+    } catch (error) {
+      return new Response('节点数据生成失败：' + (error && error.message), {
+        status: 503,
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+      });
+    }
+
+    return new Response('Not Found', {
+      status: 404,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
   },
 };
 
-async function handle\u0076\u006c\u0065\u0073\u0073WebSocket(request) {
+/* ------------------------------------------------------------------
+ * 协议探测：同一入口同时接受 VLESS 与 VMess
+ * ------------------------------------------------------------------ */
+
+function concatBytes(...parts) {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+  return result;
+}
+
+function readUint32BE(bytes, offset) {
+  return (((bytes[offset] << 24) >>> 0) + ((bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3])) >>> 0;
+}
+
+function readBigUint64BE(bytes, offset) {
+  let value = 0;
+  for (let i = 0; i < 8; i++) value = value * 256 + bytes[offset + i];
+  return value;
+}
+
+const MD5_SHIFT = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+
+const MD5_TABLE = (() => {
+  const table = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) table[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
+  return table;
+})();
+
+function md5(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const bitLength = bytes.length * 8;
+  const total = ((bytes.length + 8) >> 6 << 6) + 64;
+  const buffer = new Uint8Array(total);
+  buffer.set(bytes);
+  buffer[bytes.length] = 0x80;
+  const view = new DataView(buffer.buffer);
+  view.setUint32(total - 8, bitLength >>> 0, true);
+  view.setUint32(total - 4, Math.floor(bitLength / 0x100000000), true);
+
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const words = new Uint32Array(16);
+  for (let offset = 0; offset < total; offset += 64) {
+    for (let i = 0; i < 16; i++) words[i] = view.getUint32(offset + i * 4, true);
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      const sum = (f + a + MD5_TABLE[i] + words[g]) >>> 0;
+      a = d; d = c; c = b;
+      b = (b + (((sum << MD5_SHIFT[i]) | (sum >>> (32 - MD5_SHIFT[i]))) >>> 0)) >>> 0;
+    }
+    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
+  }
+
+  const digest = new Uint8Array(16);
+  const outView = new DataView(digest.buffer);
+  outView.setUint32(0, a0, true);
+  outView.setUint32(4, b0, true);
+  outView.setUint32(8, c0, true);
+  outView.setUint32(12, d0, true);
+  return digest;
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const textEncoder = new TextEncoder();
+
+// Clash / sing-box / v2rayN 的延迟检测都请求 generate_204，这里直接应答，
+// 探测结果即该节点的握手耗时；出口 80 端口不通时也不会被判定成 Timeout
+const HEALTH_CHECK_RESPONSE = textEncoder.encode('HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+
+function isHealthCheckRequest(data) {
+  if (!data || data.length < 16) return false;
+  let text;
+  try {
+    text = new TextDecoder().decode(data.subarray(0, 128));
+  } catch (error) {
+    return false;
+  }
+  return /^(GET|HEAD)\s+\S*generate_204\S*\s+HTTP\/1\.[01]/i.test(text);
+}
+
+function closeAfterSend(ws, code, reason) {
+  setTimeout(() => {
+    try {
+      if (ws.readyState === WS_READY_STATE_OPEN) ws.close(code, reason);
+    } catch (error) {
+    }
+  }, 30);
+}
+
+const uuidBytes = (uuid) => {
+  const hex = String(uuid).replace(/-/g, '');
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return bytes;
+};
+
+// VMess 的 cmdKey 并非 UUID 本身，而是 UUID 拼接固定串后的 MD5
+const vmessCmdKey = (uuid) => md5(concatBytes(uuidBytes(uuid), textEncoder.encode('c48619fe-8f02-49e0-b9e9-edf763e17e21')));
+
+const sha256Bytes = async (data) => new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+
+async function hmacWith(hashFn, key, message) {
+  const blockSize = 64;
+  let normalized = key;
+  if (normalized.length > blockSize) normalized = await hashFn(normalized);
+  const inner = new Uint8Array(blockSize).fill(0x36);
+  const outer = new Uint8Array(blockSize).fill(0x5c);
+  for (let i = 0; i < normalized.length; i++) {
+    inner[i] ^= normalized[i];
+    outer[i] ^= normalized[i];
+  }
+  const innerDigest = await hashFn(concatBytes(inner, message));
+  return hashFn(concatBytes(outer, innerDigest));
+}
+
+// VMess 的 KDF 是逐层嵌套的 HMAC-SHA256，底层哈希会被上一层 HMAC 替换
+async function vmessKdf(key, ...paths) {
+  let hashFn = (message) => hmacWith(sha256Bytes, textEncoder.encode('VMess AEAD KDF'), message);
+  for (const path of paths) {
+    const previous = hashFn;
+    const encoded = typeof path === 'string' ? textEncoder.encode(path) : path;
+    hashFn = (message) => hmacWith(previous, encoded, message);
+  }
+  return hashFn(key);
+}
+
+const vmessKdf16 = async (key, ...paths) => (await vmessKdf(key, ...paths)).subarray(0, 16);
+
+async function aesGcmDecrypt(key, iv, ciphertext, tag, aad) {
+  const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['decrypt']);
+  const params = { name: 'AES-GCM', iv, tagLength: 128 };
+  if (aad) params.additionalData = aad;
+  return new Uint8Array(await crypto.subtle.decrypt(params, cryptoKey, concatBytes(ciphertext, tag)));
+}
+
+async function aesGcmEncrypt(key, iv, plaintext, aad) {
+  const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['encrypt']);
+  const params = { name: 'AES-GCM', iv, tagLength: 128 };
+  if (aad) params.additionalData = aad;
+  return new Uint8Array(await crypto.subtle.encrypt(params, cryptoKey, plaintext));
+}
+
+const gfMultiply = (a, b) => {
+  let product = 0;
+  for (let i = 0; i < 8; i++) {
+    if (b & 1) product ^= a;
+    const high = a & 0x80;
+    a = (a << 1) & 0xff;
+    if (high) a ^= 0x1b;
+    b >>= 1;
+  }
+  return product;
+};
+
+const AES_SBOX = (() => {
+  const box = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    let inverse = 1;
+    let base = i;
+    let power = 254;
+    while (power) {
+      if (power & 1) inverse = gfMultiply(inverse, base);
+      base = gfMultiply(base, base);
+      power >>= 1;
+    }
+    if (i === 0) inverse = 0;
+    let value = 0;
+    for (let bit = 0; bit < 8; bit++) {
+      const mixed = ((inverse >> bit) ^ (inverse >> ((bit + 4) % 8)) ^ (inverse >> ((bit + 5) % 8)) ^ (inverse >> ((bit + 6) % 8)) ^ (inverse >> ((bit + 7) % 8))) & 1;
+      value |= mixed << bit;
+    }
+    box[i] = value ^ 0x63;
+  }
+  return box;
+})();
+
+const AES_INV_SBOX = (() => {
+  const box = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) box[AES_SBOX[i]] = i;
+  return box;
+})();
+
+function aesExpandKey(key) {
+  const words = new Uint32Array(44);
+  for (let i = 0; i < 4; i++) words[i] = (key[i * 4] << 24) | (key[i * 4 + 1] << 16) | (key[i * 4 + 2] << 8) | key[i * 4 + 3];
+  let rcon = 1;
+  for (let i = 4; i < 44; i++) {
+    let temp = words[i - 1];
+    if (i % 4 === 0) {
+      temp = ((temp << 8) | (temp >>> 24)) >>> 0;
+      temp = ((AES_SBOX[(temp >>> 24) & 0xff] << 24) | (AES_SBOX[(temp >>> 16) & 0xff] << 16) | (AES_SBOX[(temp >>> 8) & 0xff] << 8) | AES_SBOX[temp & 0xff]) >>> 0;
+      temp = (temp ^ (rcon << 24)) >>> 0;
+      rcon = gfMultiply(rcon, 2);
+    }
+    words[i] = (words[i - 4] ^ temp) >>> 0;
+  }
+  return words;
+}
+
+// WebCrypto 的 AES-CBC 会做 PKCS#7 去填充，等价不了 ECB，这里直接算逆密码
+function aesDecryptBlock(key, input) {
+  const words = aesExpandKey(key);
+  const state = new Uint8Array(input);
+
+  const addRoundKey = (round) => {
+    for (let column = 0; column < 4; column++) {
+      const word = words[round * 4 + column];
+      state[4 * column] ^= (word >>> 24) & 0xff;
+      state[4 * column + 1] ^= (word >>> 16) & 0xff;
+      state[4 * column + 2] ^= (word >>> 8) & 0xff;
+      state[4 * column + 3] ^= word & 0xff;
+    }
+  };
+  const shiftRows = () => {
+    for (let row = 1; row < 4; row++) {
+      const values = [state[row], state[4 + row], state[8 + row], state[12 + row]];
+      for (let column = 0; column < 4; column++) state[4 * ((column + row) % 4) + row] = values[column];
+    }
+  };
+  const mixColumns = () => {
+    for (let column = 0; column < 4; column++) {
+      const a0 = state[4 * column], a1 = state[4 * column + 1], a2 = state[4 * column + 2], a3 = state[4 * column + 3];
+      state[4 * column] = gfMultiply(a0, 14) ^ gfMultiply(a1, 11) ^ gfMultiply(a2, 13) ^ gfMultiply(a3, 9);
+      state[4 * column + 1] = gfMultiply(a0, 9) ^ gfMultiply(a1, 14) ^ gfMultiply(a2, 11) ^ gfMultiply(a3, 13);
+      state[4 * column + 2] = gfMultiply(a0, 13) ^ gfMultiply(a1, 9) ^ gfMultiply(a2, 14) ^ gfMultiply(a3, 11);
+      state[4 * column + 3] = gfMultiply(a0, 11) ^ gfMultiply(a1, 13) ^ gfMultiply(a2, 9) ^ gfMultiply(a3, 14);
+    }
+  };
+
+  addRoundKey(10);
+  for (let round = 9; round >= 1; round--) {
+    shiftRows();
+    for (let i = 0; i < 16; i++) state[i] = AES_INV_SBOX[state[i]];
+    addRoundKey(round);
+    mixColumns();
+  }
+  shiftRows();
+  for (let i = 0; i < 16; i++) state[i] = AES_INV_SBOX[state[i]];
+  addRoundKey(0);
+  return state;
+}
+
+async function aesEcbDecryptBlock(key, block) {
+  return aesDecryptBlock(key, block);
+}
+
+async function vmessAuthCheck(authId, cmdKey) {
+  const decodeKey = await vmessKdf16(cmdKey, 'AES Auth ID Encryption');
+  let block;
+  try {
+    block = await aesEcbDecryptBlock(decodeKey, authId);
+  } catch (error) {
+    return false;
+  }
+  if (block.length !== 16) return false;
+  if (crc32(block.subarray(0, 12)) !== readUint32BE(block, 12)) return false;
+  const timestamp = readBigUint64BE(block, 0);
+  return Math.abs(timestamp - Math.floor(Date.now() / 1000)) <= 120;
+}
+
+async function vmessOpenHeader(buffer, cmdKey) {
+  if (buffer.length < 42) return null;
+  const authId = buffer.subarray(0, 16);
+  const lengthCipher = buffer.subarray(16, 18);
+  const lengthTag = buffer.subarray(18, 34);
+  const nonce = buffer.subarray(34, 42);
+
+  const lengthKey = await vmessKdf16(cmdKey, 'VMess Header AEAD Key_Length', authId, nonce);
+  const lengthIv = (await vmessKdf(cmdKey, 'VMess Header AEAD Nonce_Length', authId, nonce)).subarray(0, 12);
+
+  let lengthPlain;
+  try {
+    lengthPlain = await aesGcmDecrypt(lengthKey, lengthIv, lengthCipher, lengthTag, authId);
+  } catch (error) {
+    return { error: '头部长度解密失败' };
+  }
+
+  const payloadLength = (lengthPlain[0] << 8) | lengthPlain[1];
+  if (payloadLength < 45) return { error: '头部长度异常' };
+  const total = 42 + payloadLength + 16;
+  if (buffer.length < total) return null;
+
+  const payloadKey = await vmessKdf16(cmdKey, 'VMess Header AEAD Key', authId, nonce);
+  const payloadIv = (await vmessKdf(cmdKey, 'VMess Header AEAD Nonce', authId, nonce)).subarray(0, 12);
+
+  let header;
+  try {
+    header = await aesGcmDecrypt(payloadKey, payloadIv, buffer.subarray(42, 42 + payloadLength), buffer.subarray(42 + payloadLength, total), authId);
+  } catch (error) {
+    return { error: '头部解密失败' };
+  }
+
+  return { header, bodyStart: total };
+}
+
+function vmessParseRequest(header) {
+  if (header.length < 41 || header[0] !== 0x01) return null;
+  const request = {
+    iv: header.subarray(1, 17),
+    key: header.subarray(17, 33),
+    responseV: header[33],
+    option: header[34],
+    security: header[35] & 0x0f,
+    command: header[37],
+    port: (header[38] << 8) | header[39],
+  };
+
+  const addressType = header[40];
+  if (addressType === 0x01) {
+    request.address = Array.from(header.subarray(41, 45)).join('.');
+  } else if (addressType === 0x02) {
+    const length = header[41];
+    request.address = new TextDecoder().decode(header.subarray(42, 42 + length));
+  } else if (addressType === 0x03) {
+    const parts = [];
+    for (let i = 0; i < 8; i++) parts.push(((header[41 + i * 2] << 8) | header[42 + i * 2]).toString(16));
+    request.address = parts.join(':');
+  } else {
+    return null;
+  }
+  return request;
+}
+
+async function vmessSession(request) {
+  const encKey = (await sha256Bytes(request.key)).subarray(0, 16);
+  const encIv = (await sha256Bytes(request.iv)).subarray(0, 16);
+  // security=2 是 auto，实际客户端按 AES-128-GCM 加密
+  const security = request.security === 2 ? 3 : request.security;
+  const session = {
+    security,
+    option: request.option,
+    responseV: request.responseV,
+    decKey: request.key,
+    decIv: request.iv,
+    decNonce: 0,
+    encKey,
+    encIv,
+    encNonce: 0,
+  };
+  if (security === 3) {
+    session.respLengthKey = await vmessKdf16(encKey, 'AEAD Resp Header Len Key');
+    session.respLengthIv = (await vmessKdf(encIv, 'AEAD Resp Header Len IV')).subarray(0, 12);
+    session.respKey = await vmessKdf16(encKey, 'AEAD Resp Header Key');
+    session.respIv = (await vmessKdf(encIv, 'AEAD Resp Header IV')).subarray(0, 12);
+  }
+  return session;
+}
+
+function vmessNonce(counter, iv) {
+  const nonce = new Uint8Array(12);
+  nonce[0] = (counter >> 8) & 0xff;
+  nonce[1] = counter & 0xff;
+  nonce.set(iv.subarray(2, 12), 2);
+  return nonce;
+}
+
+async function vmessDecryptChunk(session, payload) {
+  if (session.security !== 3) return payload;
+  if (payload.length < 16) return null;
+  const plain = await aesGcmDecrypt(
+    session.decKey,
+    vmessNonce(session.decNonce, session.decIv),
+    payload.subarray(0, payload.length - 16),
+    payload.subarray(payload.length - 16),
+    null
+  ).catch(() => null);
+  if (!plain) return null;
+  session.decNonce = (session.decNonce + 1) & 0xffff;
+  return plain;
+}
+
+async function vmessEncodeChunk(session, data) {
+  let body = data;
+  if (session.security === 3) {
+    body = await aesGcmEncrypt(session.encKey, vmessNonce(session.encNonce, session.encIv), data, null);
+    session.encNonce = (session.encNonce + 1) & 0xffff;
+  }
+  if (session.option < 1) return body;
+  const frame = new Uint8Array(2 + body.length);
+  frame[0] = (body.length >> 8) & 0xff;
+  frame[1] = body.length & 0xff;
+  frame.set(body, 2);
+  return frame;
+}
+
+async function vmessResponseHeader(session) {
+  const payload = new Uint8Array([session.responseV, 0, 0, 0]);
+  if (session.security !== 3) return payload;
+  const lengthBlock = await aesGcmEncrypt(session.respLengthKey, session.respLengthIv, new Uint8Array([0, 4]), null);
+  const payloadBlock = await aesGcmEncrypt(session.respKey, session.respIv, payload, null);
+  return concatBytes(lengthBlock, payloadBlock);
+}
+
+const isIPv4 = (value) => /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
+
+function toNat64(ipv4) {
+  const hex = ipv4.split('.').map((part) => Number(part).toString(16).padStart(2, '0')).join('');
+  return `[2001:67c:2960:6464::${hex.slice(0, 4)}:${hex.slice(4, 8)}]`;
+}
+
+async function resolveNat64(address) {
+  if (isIPv4(address)) return toNat64(address);
+  const response = await fetch(`https://1.1.1.1/dns-query?name=${address}&type=A`, {
+    headers: { Accept: 'application/dns-json' },
+  });
+  const result = await response.json();
+  const record = (result.Answer || []).find((item) => item.type === 1);
+  if (!record) throw new Error('无法解析目标地址');
+  return toNat64(record.data);
+}
+
+async function connectTarget(address, port) {
+  try {
+    return await connectWithTimeout({ hostname: address, port });
+  } catch (error) {
+    const nat64 = await resolveNat64(address);
+    return connectWithTimeout({ hostname: nat64, port });
+  }
+}
+
+function isNormalClose(error) {
+  const text = `${(error && error.name) || ''} ${(error && error.message) || ''}`;
+  return /abort|closed|close|disconnect|network connection lost/i.test(text);
+}
+
+async function pipeVmessRemote(remote, ws, session) {
+  const reader = remote.readable.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (ws.readyState !== WS_READY_STATE_OPEN) break;
+      const data = toBytes(value);
+      for (let offset = 0; offset < data.length; offset += 0x3fff) {
+        ws.send(await vmessEncodeChunk(session, data.subarray(offset, offset + 0x3fff)));
+      }
+    }
+    if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1000, '正常关闭');
+  } catch (error) {
+    if (!isNormalClose(error)) console.error('VMess 转发错误:', error);
+    closeSocket(remote);
+  } finally {
+    try { reader.releaseLock(); } catch (error) {}
+  }
+}
+
+function toBytes(data) {
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return new Uint8Array(data);
+}
+
+/* ------------------------------------------------------------------
+ * Trojan 用的 SHA-224（WebCrypto 没有，自己算）
+ * ------------------------------------------------------------------ */
+
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+function sha224(input) {
+  const bytes = toBytes(input);
+  const h = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
+  const bitLength = bytes.length * 8;
+  const padded = new Uint8Array((((bytes.length + 9) + 63) >> 6) << 6);
+  padded.set(bytes, 0);
+  padded[bytes.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, Math.floor(bitLength / 0x100000000));
+  view.setUint32(padded.length - 4, bitLength >>> 0);
+
+  const rotr = (value, shift) => (value >>> shift) | (value << (32 - shift));
+  const w = new Uint32Array(64);
+
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    for (let i = 0; i < 16; i += 1) w[i] = view.getUint32(offset + i * 4);
+    for (let i = 16; i < 64; i += 1) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i += 1) {
+      const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (hh + s1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + maj) >>> 0;
+      hh = g;
+      g = f;
+      f = e;
+      e = (d + t1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0;
+    h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0;
+    h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0;
+    h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0;
+    h[7] = (h[7] + hh) >>> 0;
+  }
+
+  const out = new Uint8Array(28);
+  const outView = new DataView(out.buffer);
+  for (let i = 0; i < 7; i += 1) outView.setUint32(i * 4, h[i]);
+  return out;
+}
+
+const toHex = (bytes) => Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+
+// Trojan 客户端先发 56 字节 hex(SHA224(口令)) 作为身份
+const trojanHash = toHex(sha224(textEncoder.encode(TROJAN_PASSWORD)));
+
+/* ------------------------------------------------------------------
+ * 目标连接：直连 → NAT64 → proxyip（CF 托管站点只能走后者）
+ * ------------------------------------------------------------------ */
+
+// Cloudflare 自己的 IPv4 段：目标落在这些段里就只能走 proxyip
+const CF_CIDRS = [
+  [173, 245, 48, 20], [103, 21, 244, 22], [103, 22, 200, 22], [103, 31, 4, 22],
+  [141, 101, 64, 18], [108, 162, 192, 18], [190, 93, 240, 20], [188, 114, 96, 20],
+  [197, 234, 240, 22], [198, 41, 128, 17], [162, 158, 0, 15], [104, 16, 0, 13],
+  [104, 24, 0, 14], [172, 64, 0, 13], [131, 0, 72, 22], [104, 17, 0, 16],
+];
+
+function ipInCloudflare(ip) {
+  const parts = String(ip).split('.').map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  const value = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+  return CF_CIDRS.some(([a, b, c, bits]) => {
+    const network = ((a << 24) | (b << 16) | (c << 8)) >>> 0;
+    const size = 2 ** (32 - bits);
+    return value >= network && value < network + size;
+  });
+}
+
+const dnsCache = new Map();
+
+async function resolveIPv4(domain) {
+  if (dnsCache.has(domain)) return dnsCache.get(domain);
+  let list = [];
+  try {
+    const response = await fetch('https://1.1.1.1/dns-query?name=' + encodeURIComponent(domain) + '&type=A', {
+      headers: { accept: 'application/dns-json' },
+    });
+    const json = await response.json();
+    list = (json.Answer || []).filter((item) => item.type === 1).map((item) => item.data);
+  } catch (error) {
+    list = [];
+  }
+  if (dnsCache.size > 500) dnsCache.clear();
+  dnsCache.set(domain, list);
+  return list;
+}
+
+const cfHostCache = new Map();
+
+// 判断目标是否在 CF 段：IP 直接判断；域名查一次 DoH 并缓存（延迟检测走本地 204，不受影响）
+async function needsProxyip(address) {
+  if (isIPv4(address)) return ipInCloudflare(address);
+  if (cfHostCache.has(address)) return cfHostCache.get(address);
+  const list = await resolveIPv4(address);
+  const hosted = list.some((ip) => ipInCloudflare(ip));
+  if (cfHostCache.size > 500) cfHostCache.clear();
+  cfHostCache.set(address, hosted);
+  return hosted;
+}
+
+function markCloudflareHost(address) {
+  if (!address || isIPv4(address)) return;
+  if (cfHostCache.size > 500) cfHostCache.clear();
+  cfHostCache.set(address, true);
+}
+
+function parseProxyip(value) {
+  const index = String(value).lastIndexOf(':');
+  if (index <= 0) return null;
+  const port = Number(String(value).slice(index + 1));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { hostname: String(value).slice(0, index), port };
+}
+
+async function writeSocket(socket, payload) {
+  if (!payload || !payload.length) return;
+  const writer = socket.writable.getWriter();
+  await writer.write(payload);
+  writer.releaseLock();
+}
+
+// 依次尝试：直连 → NAT64 → 各个 proxyip。首包要一起写，连 CF 的 IP 时错误在 write 阶段才暴露
+async function openTarget(address, port, payload) {
+  const attempts = [{ label: 'direct', options: { hostname: address, port } }];
+  if (isIPv4(address)) attempts.push({ label: 'nat64', options: { hostname: toNat64(address), port } });
+  for (const proxyip of PROXYIPS) {
+    const parsed = parseProxyip(proxyip);
+    if (parsed) attempts.push({ label: 'proxyip ' + proxyip, options: parsed });
+  }
+
+  // 目标在 CF 段里（x.com / twitter.com 这类）就先走 proxyip，别去撞 connect() 的限制
+  if (await needsProxyip(address)) {
+    attempts.sort((a, b) => (b.label.startsWith('proxyip') ? 1 : 0) - (a.label.startsWith('proxyip') ? 1 : 0));
+  }
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    let socket = null;
+    try {
+      socket = await connectWithTimeout(attempt.options, 10000);
+      await writeSocket(socket, payload);
+      return socket;
+    } catch (error) {
+      lastError = error;
+      closeSocket(socket);
+    }
+  }
+  throw lastError || new Error('无法连接目标');
+}
+
+function detectProtocol(bytes) {
+  if (!bytes.length) return '';
+  if (bytes[0] === 0x00) {
+    if (bytes.length < 17) return '';
+    return formatUUID(bytes.subarray(1, 17)) === userID ? 'vless' : 'vmess';
+  }
+  // Trojan：56 字节 hex(SHA224(口令))，可能还没收全
+  const slice = bytes.subarray(0, Math.min(56, bytes.length));
+  let prefix = '';
+  for (let i = 0; i < slice.length; i += 1) prefix += String.fromCharCode(slice[i]);
+  if (slice.length < 56) return trojanHash.startsWith(prefix) ? '' : 'vmess';
+  return prefix === trojanHash ? 'trojan' : 'vmess';
+}
+
+function connectWithTimeout(options, ms = 15000) {
+  return Promise.race([
+    connect(options),
+    new Promise((resolve, reject) => setTimeout(() => reject(new Error('连接超时')), ms)),
+  ]);
+}
+
+// 兼容不同兼容日期：message 事件可能给 ArrayBuffer，也可能给 Blob
+async function readSocketData(data) {
+  if (data == null) return new Uint8Array(0);
+  if (typeof data === 'string') return textEncoder.encode(data);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (typeof data.arrayBuffer === 'function') return new Uint8Array(await data.arrayBuffer());
+  return new Uint8Array(0);
+}
+
+async function handleProxyWebSocket(request) {
   const wsPair = new WebSocketPair();
   const [clientWS, serverWS] = Object.values(wsPair);
 
   serverWS.accept();
+  // 新兼容日期下 WebSocket 消息默认是 Blob，这里强制成 ArrayBuffer
+  try { serverWS.binaryType = 'arraybuffer'; } catch (error) {}
 
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
-  const wsReadable = createWebSocketReadableStream(serverWS, earlyDataHeader);
-  let remoteSocket = null;
 
-  let udpStreamWrite = null;
-  let isDns = false;
-  
-  wsReadable.pipeTo(new WritableStream({
-    async write(chunk) {
+  let session = null;
+  let pending = new Uint8Array(0);
+  let closed = false;
+  let queue = Promise.resolve();
 
-      if (isDns && udpStreamWrite) {
-        return udpStreamWrite(chunk);
-      }
-      
-      if (remoteSocket) {
-        const writer = remoteSocket.writable.getWriter();
-        await writer.write(chunk);
-        writer.releaseLock();
-        return;
-      }
+  const fail = (error) => {
+    if (!isNormalClose(error)) console.error('WebSocket 错误:', error);
+    closed = true;
+    if (session) session.close();
+    try {
+      if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.close(1011, '内部错误');
+    } catch (closeError) {}
+  };
 
-      const result = parse\u0076\u006c\u0065\u0073\u0073Header(chunk, userID);
-      if (result.hasError) {
-        throw new Error(result.message);
-      }
+  const consume = async (data) => {
+    if (closed) return;
+    const bytes = await readSocketData(data);
+    if (closed || !bytes.length) return;
 
-      const \u0076\u006c\u0065\u0073\u0073RespHeader = new Uint8Array([result.\u0076\u006c\u0065\u0073\u0073Version[0], 0]);
-      const rawClientData = chunk.slice(result.rawDataIndex);
-      
-      if (result.isUDP) {
-        if (result.portRemote === 53) {
-          isDns = true;
-          const { write } = await handleUDPOutBound(serverWS, \u0076\u006c\u0065\u0073\u0073RespHeader);
-          udpStreamWrite = write;
-          udpStreamWrite(rawClientData);
-          return;
-        } else {
-          throw new Error('UDP代理仅支持DNS(端口53)');
-        }
-      }
+    if (session) return session.feed(bytes);
 
-      async function connectAndWrite(address, port) {
-        const tcpSocket = await connect({
-          hostname: address,
-          port: port
-        });
-        remoteSocket = tcpSocket;
-        const writer = tcpSocket.writable.getWriter();
-        await writer.write(rawClientData);
-        writer.releaseLock();
-        return tcpSocket;
-      }
+    pending = concatBytes(pending, bytes);
+    const protocol = detectProtocol(pending);
+    if (!protocol) return;
 
-      function convertToNAT64IPv6(ipv4Address) {
-        const parts = ipv4Address.split('.');
-        if (parts.length !== 4) {
-          throw new Error('无效的IPv4地址');
-        }
-        
-        const hex = parts.map(part => {
-          const num = parseInt(part, 10);
-          if (num < 0 || num > 255) {
-            throw new Error('无效的IPv4地址段');
-          }
-          return num.toString(16).padStart(2, '0');
-        });
-        const prefixes = ['2001:67c:2960:6464::'];
-        const chosenPrefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-        return `[${chosenPrefix}${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
-      }
+    const buffered = pending;
+    pending = new Uint8Array(0);
+    session = protocol === 'vmess'
+      ? createVmessSession(serverWS)
+      : (protocol === 'trojan' ? createTrojanSession(serverWS) : createVlessSession(serverWS));
+    return session.feed(buffered);
+  };
 
-      async function getIPv6ProxyAddress(domain) {
-        try {
-          const dnsQuery = await fetch(`https://1.1.1.1/dns-query?name=${domain}&type=A`, {
-            headers: {
-              'Accept': 'application/dns-json'
-            }
-          });
-          
-          const dnsResult = await dnsQuery.json();
-          if (dnsResult.Answer && dnsResult.Answer.length > 0) {
-            const aRecord = dnsResult.Answer.find(record => record.type === 1);
-            if (aRecord) {
-              const ipv4Address = aRecord.data;
-              return convertToNAT64IPv6(ipv4Address);
-            }
-          }
-          throw new Error('无法解析域名的IPv4地址');
-        } catch (err) {
-          throw new Error(`DNS解析失败: ${err.message}`);
-        }
-      }
+  // 串行处理，保证「头部 → 数据」的顺序
+  const enqueue = (data) => {
+    queue = queue.then(() => consume(data)).catch(fail);
+  };
 
-      async function retry() {
-        try {
-          const proxyIP = await getIPv6ProxyAddress(result.addressRemote);
-          console.log(`尝试通过NAT64 IPv6地址 ${proxyIP} 连接...`);
-          const tcpSocket = await connect({
-            hostname: proxyIP,
-            port: result.portRemote
-          });
-          remoteSocket = tcpSocket;
-          const writer = tcpSocket.writable.getWriter();
-          await writer.write(rawClientData);
-          writer.releaseLock();
-
-          tcpSocket.closed.catch(error => {
-            console.error('NAT64 IPv6连接关闭错误:', error);
-          }).finally(() => {
-            if (serverWS.readyState === WS_READY_STATE_OPEN) {
-              serverWS.close(1000, '连接已关闭');
-            }
-          });
-          
-          pipeRemoteToWebSocket(tcpSocket, serverWS, \u0076\u006c\u0065\u0073\u0073RespHeader, null);
-        } catch (err) {
-          console.error('NAT64 IPv6连接失败:', err);
-          serverWS.close(1011, 'NAT64 IPv6连接失败: ' + err.message);
-        }
-      }
-
-      try {
-        const tcpSocket = await connectAndWrite(result.addressRemote, result.portRemote);
-        pipeRemoteToWebSocket(tcpSocket, serverWS, \u0076\u006c\u0065\u0073\u0073RespHeader, retry);
-      } catch (err) {
-        console.error('连接失败:', err);
-        serverWS.close(1011, '连接失败');
-      }
-    },
-    close() {
-      if (remoteSocket) {
-        closeSocket(remoteSocket);
-      }
-    }
-  })).catch(err => {
-    console.error('WebSocket 错误:', err);
-    closeSocket(remoteSocket);
-    serverWS.close(1011, '内部错误');
+  serverWS.addEventListener('message', (event) => enqueue(event.data));
+  serverWS.addEventListener('close', () => {
+    closed = true;
+    if (session) session.close();
   });
+  serverWS.addEventListener('error', () => {
+    closed = true;
+    if (session) session.close();
+  });
+
+  if (earlyDataHeader) {
+    try {
+      const decoded = atob(earlyDataHeader.replace(/-/g, '+').replace(/_/g, '/'));
+      enqueue(Uint8Array.from(decoded, (char) => char.charCodeAt(0)));
+    } catch (error) {}
+  }
 
   return new Response(null, {
     status: 101,
@@ -343,42 +976,537 @@ async function handle\u0076\u006c\u0065\u0073\u0073WebSocket(request) {
   });
 }
 
-function createWebSocketReadableStream(ws, earlyDataHeader) {
-  return new ReadableStream({
-    start(controller) {
-      ws.addEventListener('message', event => {
-        controller.enqueue(event.data);
-      });
-      
-      ws.addEventListener('close', () => {
-        controller.close();
-      });
-      
-      ws.addEventListener('error', err => {
-        controller.error(err);
-      });
-      
-      if (earlyDataHeader) {
-        try {
-          const decoded = atob(earlyDataHeader.replace(/-/g, '+').replace(/_/g, '/'));
-          const data = Uint8Array.from(decoded, c => c.charCodeAt(0));
-          controller.enqueue(data.buffer);
-        } catch (e) {
-        }
+function createVlessSession(serverWS) {
+  let remoteSocket = null;
+  let vlessResponseHeader = null;
+  let firstUserData = true;
+  let udpStreamWrite = null;
+  let isDns = false;
+  let targetAddress = '';
+  let targetPort = 0;
+  let awaitingFirstData = false;
+  let pipeEpoch = 0;
+
+  // 写远端；如果直连被 CF 拒绝（x.com 这类 CF 托管站点），马上换 proxyip 重来
+  async function writeRemote(bytes) {
+    if (!remoteSocket) return false;
+    const writer = remoteSocket.writable.getWriter();
+    try {
+      await writer.write(bytes);
+      writer.releaseLock();
+      return true;
+    } catch (error) {
+      try { writer.releaseLock(); } catch (lockError) {}
+      closeSocket(remoteSocket);
+      remoteSocket = null;
+      markCloudflareHost(targetAddress);
+      try {
+        const socket = await openTarget(targetAddress, targetPort, bytes);
+        remoteSocket = socket;
+        const epoch = ++pipeEpoch;
+        pipeRemoteToWebSocket(socket, serverWS, vlessResponseHeader, retry, () => epoch === pipeEpoch);
+        return true;
+      } catch (retryError) {
+        console.error('proxyip 重试失败:', retryError);
+        return false;
       }
     }
-  });
+  }
+
+  async function feed(chunk) {
+
+    if (isDns && udpStreamWrite) {
+      return udpStreamWrite(chunk);
+    }
+
+    // 头部里没带数据时先不连，等真正的首包（TLS ClientHello）到了再连，
+    // 这样 x.com 这类 CF 托管站点可以直接落到 proxyip 上，不会先连 CF 的 IP 再被掐断
+    if (awaitingFirstData) {
+      awaitingFirstData = false;
+      // Clash 的延迟检测就地应答，别去连上游，否则测出来的延迟虚高
+      if (isHealthCheckRequest(chunk)) {
+        if (serverWS.readyState === WS_READY_STATE_OPEN) {
+          serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+          closeAfterSend(serverWS, 1000, '延迟检测');
+        }
+        return;
+      }
+      try {
+        const socket = await openTarget(targetAddress, targetPort, chunk);
+        remoteSocket = socket;
+        const epoch = ++pipeEpoch;
+        pipeRemoteToWebSocket(socket, serverWS, vlessResponseHeader, null, () => epoch === pipeEpoch);
+      } catch (error) {
+        console.error('连接失败:', error && error.message);
+        try { serverWS.close(1011, '连接失败'); } catch (closeError) {}
+      }
+      return;
+    }
+
+    if (remoteSocket) {
+      if (firstUserData) {
+        firstUserData = false;
+        if (isHealthCheckRequest(chunk)) {
+          closeSocket(remoteSocket);
+          remoteSocket = null;
+          if (serverWS.readyState === WS_READY_STATE_OPEN) {
+            serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+            closeAfterSend(serverWS, 1000, '延迟检测');
+          }
+          return;
+        }
+      }
+      if (!(await writeRemote(chunk))) throw new Error('数据转发失败');
+      return;
+    }
+
+    const result = parse\u0076\u006c\u0065\u0073\u0073Header(chunk, userID);
+    if (result.hasError) {
+      throw new Error(result.message);
+    }
+
+    vlessResponseHeader = new Uint8Array([result.\u0076\u006c\u0065\u0073\u0073Version[0], 0]);
+    const rawClientData = chunk.slice(result.rawDataIndex);
+    targetAddress = result.addressRemote;
+    targetPort = result.portRemote;
+
+    if (!result.isUDP && isHealthCheckRequest(rawClientData)) {
+      serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+      closeAfterSend(serverWS, 1000, '延迟检测');
+      return;
+    }
+
+    if (result.isUDP) {
+      if (result.portRemote === 53) {
+        isDns = true;
+        const { write } = await handleUDPOutBound(serverWS, vlessResponseHeader);
+        udpStreamWrite = write;
+        udpStreamWrite(rawClientData);
+        return;
+      } else {
+        throw new Error('UDP代理仅支持DNS(端口53)');
+      }
+    }
+
+    async function connectAndWrite(address, port) {
+      // 直连 → NAT64 → proxyip（x.com / twitter.com 这类 CF 托管站点只能走 proxyip）
+      const tcpSocket = await openTarget(address, port, rawClientData);
+      remoteSocket = tcpSocket;
+      return tcpSocket;
+    }
+
+    function convertToNAT64IPv6(ipv4Address) {
+      const parts = ipv4Address.split('.');
+      if (parts.length !== 4) {
+        throw new Error('无效的IPv4地址');
+      }
+
+      const hex = parts.map(part => {
+        const num = parseInt(part, 10);
+        if (num < 0 || num > 255) {
+          throw new Error('无效的IPv4地址段');
+        }
+        return num.toString(16).padStart(2, '0');
+      });
+      const prefixes = ['2001:67c:2960:6464::'];
+      const chosenPrefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+      return `[${chosenPrefix}${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+    }
+
+    async function getIPv6ProxyAddress(domain) {
+      try {
+        const dnsQuery = await fetch(`https://1.1.1.1/dns-query?name=${domain}&type=A`, {
+          headers: {
+            'Accept': 'application/dns-json'
+          }
+        });
+
+        const dnsResult = await dnsQuery.json();
+        if (dnsResult.Answer && dnsResult.Answer.length > 0) {
+          const aRecord = dnsResult.Answer.find(record => record.type === 1);
+          if (aRecord) {
+            const ipv4Address = aRecord.data;
+            return convertToNAT64IPv6(ipv4Address);
+          }
+        }
+        throw new Error('无法解析域名的IPv4地址');
+      } catch (err) {
+        throw new Error(`DNS解析失败: ${err.message}`);
+      }
+    }
+
+    // 直连被拒（CF 托管站点）时的兜底：交给 proxyip 中转
+    async function retry() {
+      markCloudflareHost(result.addressRemote);
+      for (const proxyip of PROXYIPS) {
+        const parsed = parseProxyip(proxyip);
+        if (!parsed) continue;
+        let socket = null;
+        try {
+          socket = await connectWithTimeout(parsed, 10000);
+          remoteSocket = socket;
+          const epoch = ++pipeEpoch;
+          pipeRemoteToWebSocket(socket, serverWS, vlessResponseHeader, null, () => epoch === pipeEpoch);
+          console.log('已通过 proxyip', proxyip, '重连');
+          return;
+        } catch (proxyError) {
+          closeSocket(socket);
+        }
+      }
+      try { serverWS.close(1011, '连接失败'); } catch (error) {}
+    }
+
+    if (!rawClientData.length) {
+      awaitingFirstData = true;
+      return;
+    }
+
+    try {
+      const tcpSocket = await connectAndWrite(result.addressRemote, result.portRemote);
+      const epoch = ++pipeEpoch;
+      pipeRemoteToWebSocket(tcpSocket, serverWS, vlessResponseHeader, retry, () => epoch === pipeEpoch);
+    } catch (err) {
+      console.error('连接失败:', err);
+      serverWS.close(1011, '连接失败');
+    }
+  }
+
+  return {
+    feed,
+    close() {
+      closeSocket(remoteSocket);
+    }
+  };
+}
+
+function createVmessSession(ws) {
+  const cmdKey = vmessCmdKey(userID);
+  let remote = null;
+  let currentRequest = null;
+  let awaitingFirstData = false;
+  let pipeEpoch = 0;
+  let session = null;
+  let buffered = new Uint8Array(0);
+  let waitingHeader = true;
+  let authenticated = false;
+  let firstUserData = true;
+
+  function shutdown(reason) {
+    closeSocket(remote);
+    try {
+      if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1011, reason);
+    } catch (error) {
+    }
+  }
+
+  async function feed(chunk) {
+    buffered = concatBytes(buffered, chunk);
+
+    if (waitingHeader) {
+      if (buffered.length < 16) return;
+      if (!authenticated) {
+        if (!(await vmessAuthCheck(buffered.subarray(0, 16), cmdKey))) {
+          shutdown('认证失败');
+          return;
+        }
+        authenticated = true;
+      }
+
+      const opened = await vmessOpenHeader(buffered, cmdKey);
+      if (!opened) return;
+      if (opened.error) {
+        shutdown(opened.error);
+        return;
+      }
+
+      const request = vmessParseRequest(opened.header);
+      if (!request) {
+        shutdown('请求头无效');
+        return;
+      }
+      if (request.command !== 0x01) {
+        shutdown('仅支持 TCP');
+        return;
+      }
+      if (request.option >= 0x05) {
+        shutdown('暂不支持分块掩码');
+        return;
+      }
+
+      session = await vmessSession(request);
+      buffered = buffered.subarray(opened.bodyStart);
+      waitingHeader = false;
+
+      // 首个数据帧可能就是延迟检测请求，先就地应答
+      let firstPayload = null;
+      if (session.option >= 1 && buffered.length >= 2) {
+        const length = (buffered[0] << 8) | buffered[1];
+        if (buffered.length >= 2 + length) {
+          firstPayload = await vmessDecryptChunk(session, buffered.subarray(2, 2 + length));
+          buffered = buffered.subarray(2 + length);
+          if (!firstPayload) {
+            shutdown('数据解密失败');
+            return;
+          }
+        }
+      }
+
+      if (firstPayload && isHealthCheckRequest(firstPayload)) {
+        if (ws.readyState === WS_READY_STATE_OPEN) {
+          ws.send(await vmessResponseHeader(session));
+          ws.send(await vmessEncodeChunk(session, HEALTH_CHECK_RESPONSE));
+          closeAfterSend(ws, 1000, '延迟检测');
+        }
+        return;
+      }
+
+      if (!firstPayload || !firstPayload.length) {
+        // 头部没带数据：等第一个数据帧再连，x.com 这类 CF 托管站点才能落到 proxyip
+        currentRequest = request;
+        awaitingFirstData = true;
+        return;
+      }
+
+      try {
+        remote = await openTarget(request.address, request.port, firstPayload);
+      } catch (error) {
+        shutdown('连接失败');
+        return;
+      }
+
+      if (ws.readyState === WS_READY_STATE_OPEN) ws.send(await vmessResponseHeader(session));
+      pipeVmessRemote(remote, ws, session);
+
+      if (firstPayload && firstPayload.length) firstUserData = false;
+    }
+
+    if (awaitingFirstData && currentRequest) {
+      if (session.option >= 1) {
+        if (buffered.length < 2) return;
+        const pendingLength = (buffered[0] << 8) | buffered[1];
+        if (buffered.length < 2 + pendingLength) return;
+        const firstPlain = await vmessDecryptChunk(session, buffered.subarray(2, 2 + pendingLength));
+        buffered = buffered.subarray(2 + pendingLength);
+        if (!firstPlain) {
+          shutdown('数据解密失败');
+          return;
+        }
+        awaitingFirstData = false;
+        if (isHealthCheckRequest(firstPlain)) {
+          if (ws.readyState === WS_READY_STATE_OPEN) {
+            ws.send(await vmessResponseHeader(session));
+            ws.send(await vmessEncodeChunk(session, HEALTH_CHECK_RESPONSE));
+            closeAfterSend(ws, 1000, '延迟检测');
+          }
+          return;
+        }
+        try {
+          remote = await openTarget(currentRequest.address, currentRequest.port, firstPlain);
+        } catch (error) {
+          shutdown('连接失败');
+          return;
+        }
+        if (ws.readyState === WS_READY_STATE_OPEN) ws.send(await vmessResponseHeader(session));
+        pipeVmessRemote(remote, ws, session);
+        firstUserData = false;
+        return;
+      }
+    }
+
+    if (session.option < 1) {
+      // 不分帧：整段即数据
+      if (buffered.length && remote) {
+        const writer = remote.writable.getWriter();
+        await writer.write(buffered);
+        writer.releaseLock();
+      }
+      buffered = new Uint8Array(0);
+      return;
+    }
+
+    while (buffered.length >= 2) {
+      const length = (buffered[0] << 8) | buffered[1];
+      if (buffered.length < 2 + length) break;
+      const plain = await vmessDecryptChunk(session, buffered.subarray(2, 2 + length));
+      buffered = buffered.subarray(2 + length);
+      if (!plain) {
+        shutdown('数据解密失败');
+        return;
+      }
+      if (firstUserData) {
+        firstUserData = false;
+        if (isHealthCheckRequest(plain)) {
+          closeSocket(remote);
+          remote = null;
+          if (ws.readyState === WS_READY_STATE_OPEN) {
+            ws.send(await vmessEncodeChunk(session, HEALTH_CHECK_RESPONSE));
+            closeAfterSend(ws, 1000, '延迟检测');
+          }
+          return;
+        }
+      }
+      if (plain.length && remote) {
+        const writer = remote.writable.getWriter();
+        await writer.write(plain);
+        writer.releaseLock();
+      }
+    }
+  }
+
+  return {
+    feed,
+    close() {
+      closeSocket(remote);
+    }
+  };
+}
+
+
+/* ------------------------------------------------------------------
+ * Trojan：56 字节口令 + CRLF + CMD + ATYP + ADDR + PORT + CRLF + 数据
+ * ------------------------------------------------------------------ */
+
+async function pipeRemoteRaw(remoteSocket, ws) {
+  const reader = remoteSocket.readable.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (ws.readyState !== WS_READY_STATE_OPEN) break;
+      const chunk = toBytes(value);
+      if (chunk.length) ws.send(chunk);
+    }
+    if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1000, '正常关闭');
+  } catch (error) {
+    if (!isNormalClose(error)) console.error('Trojan 转发错误:', error);
+    closeSocket(remoteSocket);
+  } finally {
+    try { reader.releaseLock(); } catch (error) {}
+  }
+}
+
+function createTrojanSession(serverWS) {
+  let remote = null;
+  let buffered = new Uint8Array(0);
+  let shut = false;
+  let awaiting = null;
+
+  function shutdown(reason) {
+    if (shut) return;
+    shut = true;
+    closeSocket(remote);
+    try {
+      if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.close(1011, reason);
+    } catch (error) {}
+  }
+
+  async function feed(chunk) {
+    if (remote) {
+      const writer = remote.writable.getWriter();
+      await writer.write(chunk);
+      writer.releaseLock();
+      return;
+    }
+
+    // 口令帧里没有数据时，等首个真实数据包再连（便于落到 proxyip）
+    if (awaiting) {
+      const target = awaiting;
+      awaiting = null;
+      if (isHealthCheckRequest(chunk)) {
+        if (serverWS.readyState === WS_READY_STATE_OPEN) {
+          serverWS.send(HEALTH_CHECK_RESPONSE);
+          closeAfterSend(serverWS, 1000, '延迟检测');
+        }
+        return;
+      }
+      try {
+        remote = await openTarget(target.address, target.port, chunk);
+      } catch (error) {
+        shutdown('连接失败');
+        return;
+      }
+      pipeRemoteRaw(remote, serverWS);
+      return;
+    }
+
+    buffered = concatBytes(buffered, chunk);
+    if (buffered.length < 58) return;
+    const bytes = buffered;
+    if (bytes[56] !== 0x0d || bytes[57] !== 0x0a) return shutdown('Trojan 口令格式错误');
+
+    let offset = 58;
+    const command = bytes[offset++];
+    if (command !== 0x01) return shutdown('Trojan 暂只支持 CONNECT');
+    const addressType = bytes[offset++];
+    let address = '';
+    if (addressType === 0x01) {
+      if (bytes.length < offset + 6 + 2) return;
+      address = Array.from(bytes.subarray(offset, offset + 4)).join('.');
+      offset += 4;
+    } else if (addressType === 0x03) {
+      if (bytes.length < offset + 1) return;
+      const length = bytes[offset];
+      if (bytes.length < offset + 3 + length + 2) return;
+      address = new TextDecoder().decode(bytes.subarray(offset + 1, offset + 1 + length));
+      offset += 1 + length;
+    } else if (addressType === 0x04) {
+      if (bytes.length < offset + 18 + 2) return;
+      const parts = [];
+      for (let i = 0; i < 8; i += 1) parts.push(((bytes[offset + i * 2] << 8) | bytes[offset + i * 2 + 1]).toString(16));
+      address = parts.join(':');
+      offset += 16;
+    } else {
+      return shutdown('Trojan 地址类型不支持');
+    }
+
+    const port = (bytes[offset] << 8) | bytes[offset + 1];
+    offset += 2;
+    if (bytes[offset] !== 0x0d || bytes[offset + 1] !== 0x0a) return shutdown('Trojan 请求格式错误');
+    offset += 2;
+
+    const payload = bytes.slice(offset);
+    buffered = new Uint8Array(0);
+    if (!payload.length) {
+      awaiting = { address, port };
+      return;
+    }
+    if (isHealthCheckRequest(payload)) {
+      if (serverWS.readyState === WS_READY_STATE_OPEN) {
+        serverWS.send(HEALTH_CHECK_RESPONSE);
+        closeAfterSend(serverWS, 1000, '延迟检测');
+      }
+      return;
+    }
+    try {
+      remote = await openTarget(address, port, payload);
+    } catch (error) {
+      shutdown('连接失败');
+      return;
+    }
+    pipeRemoteRaw(remote, serverWS);
+  }
+
+  return {
+    feed,
+    close() {
+      closeSocket(remote);
+    },
+  };
 }
 
 function parse\u0076\u006c\u0065\u0073\u0073Header(buffer, userID) {
-  if (buffer.byteLength < 24) {
+  // WS 消息可能是 ArrayBuffer，也可能是视图，统一成字节视图再解析
+  const bytes = ArrayBuffer.isView(buffer)
+    ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+    : new Uint8Array(buffer);
+  if (bytes.length < 24) {
     return { hasError: true, message: '无效的头部长度' };
   }
-  
-  const view = new DataView(buffer);
-  const version = new Uint8Array(buffer.slice(0, 1));
-  
-  const uuid = formatUUID(new Uint8Array(buffer.slice(1, 17)));
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const version = bytes.slice(0, 1);
+
+  const uuid = formatUUID(bytes.slice(1, 17));
   if (uuid !== userID) {
     return { hasError: true, message: '无效的用户' };
   }
@@ -405,13 +1533,13 @@ function parse\u0076\u006c\u0065\u0073\u0073Header(buffer, userID) {
   
   switch (addressType) {
     case 1: // IPv4
-      address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
+      address = Array.from(bytes.slice(offset, offset + 4)).join('.');
       offset += 4;
       break;
       
     case 2: // 域名
       const domainLength = view.getUint8(offset++);
-      address = new TextDecoder().decode(buffer.slice(offset, offset + domainLength));
+      address = new TextDecoder().decode(bytes.slice(offset, offset + domainLength));
       offset += domainLength;
       break;
       
@@ -438,44 +1566,40 @@ function parse\u0076\u006c\u0065\u0073\u0073Header(buffer, userID) {
   };
 }
 
-function pipeRemoteToWebSocket(remoteSocket, ws, \u0076\u006c\u0065\u0073\u0073Header, retry = null) {
+async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, retry = null, isCurrent = null) {
   let headerSent = false;
   let hasIncomingData = false;
-  
-  remoteSocket.readable.pipeTo(new WritableStream({
-    write(chunk) {
+  const stale = () => (typeof isCurrent === 'function' ? !isCurrent() : false);
+  const reader = remoteSocket.readable.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
       hasIncomingData = true;
-      if (ws.readyState === WS_READY_STATE_OPEN) {
-        if (!headerSent) {
-          const combined = new Uint8Array(\u0076\u006c\u0065\u0073\u0073Header.byteLength + chunk.byteLength);
-          combined.set(new Uint8Array(\u0076\u006c\u0065\u0073\u0073Header), 0);
-          combined.set(new Uint8Array(chunk), \u0076\u006c\u0065\u0073\u0073Header.byteLength);
-          ws.send(combined.buffer);
-          headerSent = true;
-        } else {
-          ws.send(chunk);
-        }
+      if (ws.readyState !== WS_READY_STATE_OPEN) break;
+      const chunk = toBytes(value);
+      if (!chunk.length) continue;
+      if (!headerSent) {
+        ws.send(concatBytes(vlessHeader, chunk).buffer);
+        headerSent = true;
+      } else {
+        ws.send(chunk);
       }
-    },
-    close() {
-      if (!hasIncomingData && retry) {
-        retry();
-        return;
-      }
-      if (ws.readyState === WS_READY_STATE_OPEN) {
-        ws.close(1000, '正常关闭');
-      }
-    },
-    abort() {
-      closeSocket(remoteSocket);
     }
-  })).catch(err => {
-    console.error('数据转发错误:', err);
+    if (stale()) return;
+    if (!hasIncomingData && retry) {
+      retry();
+      return;
+    }
+    if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1000, '正常关闭');
+  } catch (error) {
+    if (stale()) return;
+    if (!isNormalClose(error)) console.error('数据转发错误:', error);
     closeSocket(remoteSocket);
-    if (ws.readyState === WS_READY_STATE_OPEN) {
-      ws.close(1011, '数据传输错误');
-    }
-  });
+    if (ws.readyState === WS_READY_STATE_OPEN) ws.close(1011, '数据传输错误');
+  } finally {
+    try { reader.releaseLock(); } catch (error) {}
+  }
 }
 
 function closeSocket(socket) {
@@ -492,1894 +1616,1082 @@ function formatUUID(bytes) {
   return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
 }
 
-async function handleUDPOutBound(webSocket, \u0076\u006c\u0065\u0073\u0073ResponseHeader) {
-  let is\u0076\u006c\u0065\u0073\u0073HeaderSent = false;
-  const transformStream = new TransformStream({
-    start(controller) {
-    },
-    transform(chunk, controller) {
-      for (let index = 0; index < chunk.byteLength;) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(
-          chunk.slice(index + 2, index + 2 + udpPacketLength)
-        );
-        index = index + 2 + udpPacketLength;
-        controller.enqueue(udpData);
-      }
-    },
-    flush(controller) {
-    }
-  });
+function handleUDPOutBound(webSocket, vlessResponseHeader) {
+  let headerSent = false;
+  let chain = Promise.resolve();
 
-  transformStream.readable.pipeTo(new WritableStream({
-    async write(chunk) {
-      const resp = await fetch('https://1.1.1.1/dns-query',
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/dns-message',
-          },
-          body: chunk,
-        })
-      const dnsQueryResult = await resp.arrayBuffer();
-      const udpSize = dnsQueryResult.byteLength;
-      const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-      
-      if (webSocket.readyState === WS_READY_STATE_OPEN) {
-        console.log(`DNS查询成功，DNS消息长度为 ${udpSize}`);
-        if (is\u0076\u006c\u0065\u0073\u0073HeaderSent) {
-          webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-        } else {
-          webSocket.send(await new Blob([\u0076\u006c\u0065\u0073\u0073ResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-          is\u0076\u006c\u0065\u0073\u0073HeaderSent = true;
-        }
-      }
+  async function sendDns(packet) {
+    const resp = await fetch('https://1.1.1.1/dns-query', {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: packet,
+    });
+    const dnsQueryResult = await resp.arrayBuffer();
+    const udpSize = dnsQueryResult.byteLength;
+    const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+    if (webSocket.readyState !== WS_READY_STATE_OPEN) return;
+    if (headerSent) {
+      webSocket.send(concatBytes(udpSizeBuffer, new Uint8Array(dnsQueryResult)).buffer);
+    } else {
+      webSocket.send(concatBytes(vlessResponseHeader, udpSizeBuffer, new Uint8Array(dnsQueryResult)).buffer);
+      headerSent = true;
     }
-  })).catch((error) => {
-    console.error('DNS UDP处理错误:', error);
-  });
-
-  const writer = transformStream.writable.getWriter();
+  }
 
   return {
     write(chunk) {
-      writer.write(chunk);
-    }
+      chain = chain.then(async () => {
+        const bytes = toBytes(chunk);
+        for (let index = 0; index + 2 <= bytes.length;) {
+          const length = (bytes[index] << 8) | bytes[index + 1];
+          const start = index + 2;
+          const end = start + length;
+          if (end > bytes.length) break;
+          index = end;
+          await sendDns(bytes.slice(start, end));
+        }
+      }).catch((error) => {
+        console.error('DNS UDP处理错误:', error);
+      });
+    },
   };
 }
-/**
- *
- * @param {string} userID
- * @param {string | null} hostName
- * @returns {string}
- */
-function get\u0076\u006c\u0065\u0073\u0073Config(userID, hostName) {
-  const w\u0076\u006c\u0065\u0073\u0073ws = `\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${CDNIP}:8880?encryption=none&security=none&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#${hostName}`;
-  const p\u0076\u006c\u0065\u0073\u0073wstls = `\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${CDNIP}:8443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&fp=random&path=%2F%3Fed%3D2560#${hostName}`;
-  const note = `说明：\n配置由Lhy搭建和分享\nClash Verge的延迟检测有故障，Timeout仍可上网，不影响正常使用。\n节点地区非CDN服务器精确位置\n由于有内部访问隔离，CF节点可能无法访问由Cloudflare提供服务的墙外网站。\nProxyIP使用nat64自动生成，无需设置`;
-  const ty = `https://${hostName}/${userID}/ty`
-  const cl = `https://${hostName}/${userID}/cl`
-  const sb = `https://${hostName}/${userID}/sb`
-  const pty = `https://${hostName}/${userID}/pty`
-  const pcl = `https://${hostName}/${userID}/pcl`
-  const psb = `https://${hostName}/${userID}/psb`
-
-  const wk\u0076\u006c\u0065\u0073\u0073share = btoa(`\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP1}:${PT1}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V1_${IP1}_${PT1}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP2}:${PT2}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V2_${IP2}_${PT2}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP3}:${PT3}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V3_${IP3}_${PT3}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP4}:${PT4}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V4_${IP4}_${PT4}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP5}:${PT5}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V5_${IP5}_${PT5}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP6}:${PT6}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V6_${IP6}_${PT6}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP7}:${PT7}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V7_${IP7}_${PT7}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP8}:${PT8}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V8_${IP8}_${PT8}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP9}:${PT9}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V9_${IP9}_${PT9}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP10}:${PT10}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V10_${IP10}_${PT10}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP11}:${PT11}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V11_${IP11}_${PT11}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP12}:${PT12}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V12_${IP12}_${PT12}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP13}:${PT13}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V13_${IP13}_${PT13}`);
 
 
-  const pg\u0076\u006c\u0065\u0073\u0073share = btoa(`\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP8}:${PT8}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V8_${IP8}_${PT8}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP9}:${PT9}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V9_${IP9}_${PT9}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP10}:${PT10}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V10_${IP10}_${PT10}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP11}:${PT11}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V11_${IP11}_${PT11}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP12}:${PT12}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V12_${IP12}_${PT12}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP13}:${PT13}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V13_${IP13}_${PT13}`);	
+/* ==========================================================================
+ * 节点数据：抓取 → 解析 → 评分 → 按地区挑选
+ * ========================================================================== */
 
-	
-  const noteshow = note.replace(/\n/g, '<br>');
-  const displayHtml = `
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
-<style>
-.limited-width {
-    max-width: 200px;
-    overflow: auto;
-    word-wrap: break-word;
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
 }
-</style>
-</head>
-<script>
-function copyToClipboard(text) {
-  const input = document.createElement('textarea');
-  input.style.position = 'fixed';
-  input.style.opacity = 0;
-  input.value = text;
-  document.body.appendChild(input);
-  input.select();
-  document.execCommand('Copy');
-  document.body.removeChild(input);
-  alert('已复制到剪贴板');
+
+function clampNumber(value, min, max) {
+  const number = Number(String(value == null ? '' : value).replace(/[^\d.\-]/g, ''));
+  if (!Number.isFinite(number)) return 0;
+  return clamp(number, min, max);
 }
-</script>
-`;
-if (hostName.includes("workers.dev")) {
-return `
-<br>
-<br>
-${displayHtml}
-<body>
-<div class="container">
-    <div class="row">
-        <div class="col-md-12">
-            <h1>Cloudflare-workers/pages-\u0076\u006c\u0065\u0073\u0073代理脚本 V25.5.27</h1>
-	    <hr>
-            <p>${noteshow}</p>
-            <hr>
-	    <hr>
-	    <hr>
-            <br>
-            <br>
-            <table class="table">
-						<thead>
-							<tr>
-								<th>Clash-meta/Verge订阅链接：</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td class="limited-width">${cl}</td>	
-								<td><button class="btn btn-primary" onclick="copyToClipboard('${cl}')">点击复制链接</button></td>
-							</tr>
-						</tbody>
-					</table>
-            <h3>1：CF-workers-\u0076\u006c\u0065\u0073\u0073+ws节点</h3>
-			<table class="table">
-				<thead>
-					<tr>
-						<th>节点特色：</th>
-						<th>单节点链接如下：</th>
-					</tr>
-				</thead>
-				<tbody>
-					<tr>
-						<td class="limited-width">关闭了TLS加密，无视域名阻断</td>
-						<td class="limited-width">${w\u0076\u006c\u0065\u0073\u0073ws}</td>
-						<td><button class="btn btn-primary" onclick="copyToClipboard('${w\u0076\u006c\u0065\u0073\u0073ws}')">点击复制链接</button></td>
-					</tr>
-				</tbody>
-			</table>
-            <h5>客户端参数如下：</h5>
-            <ul>
-                <li>客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP 或者 反代IP</li>
-                <li>端口(port)：7个http端口可任意选择(80、8080、8880、2052、2082、2086、2095)，或反代IP对应端口</li>
-                <li>用户ID(uuid)：${userID}</li>
-                <li>传输协议(network)：ws 或者 websocket</li>
-                <li>伪装域名(host)：${hostName}</li>
-                <li>路径(path)：/?ed=2560</li>
-		<li>传输安全(TLS)：关闭</li>
-            </ul>
-            <hr>
-			<hr>
-			<hr>
-            <br>
-            <br>
-            <h3>2：CF-workers-\u0076\u006c\u0065\u0073\u0073+ws+tls节点</h3>
-			<table class="table">
-				<thead>
-					<tr>
-						<th>节点特色：</th>
-						<th>单节点链接如下：</th>
-					</tr>
-				</thead>
-				<tbody>
-					<tr>
-						<td class="limited-width">启用了TLS加密，<br>如果客户端支持分片(Fragment)功能，建议开启，防止域名阻断</td>
-						<td class="limited-width">${p\u0076\u006c\u0065\u0073\u0073wstls}</td>	
-						<td><button class="btn btn-primary" onclick="copyToClipboard('${p\u0076\u006c\u0065\u0073\u0073wstls}')">点击复制链接</button></td>
-					</tr>
-				</tbody>
-			</table>
-            <h5>客户端参数如下：</h5>
-            <ul>
-                <li>客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP 或者 反代IP</li>
-                <li>端口(port)：6个https端口可任意选择(443、8443、2053、2083、2087、2096)，或反代IP对应端口</li>
-                <li>用户ID(uuid)：${userID}</li>
-                <li>传输协议(network)：ws 或者 websocket</li>
-                <li>伪装域名(host)：${hostName}</li>
-                <li>路径(path)：/?ed=2560</li>
-                <li>传输安全(TLS)：开启</li>
-                <li>跳过证书验证(allowlnsecure)：false</li>
-			</ul>
-			<hr>
-			<hr>
-			<hr>
-			<br>	
-			<br>
-			<h3>3：聚合通用、Clash-meta、Sing-box订阅链接如下：</h3>
-			<hr>
-			<p>注意：<br>1、默认每个订阅链接包含TLS+非TLS共13个端口节点<br>2、当前workers域名作为订阅链接，需通过代理进行订阅更新<br>3、如使用的客户端不支持分片功能，则TLS节点不可用</p>
-			<hr>
 
+function normalizeHost(value) {
+  const host = String(value == null ? '' : value)
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .replace(/^\[|\]$/g, '');
+  if (!host || host.length > 60) return '';
+  if (!/^[0-9a-zA-Z.\-:]+$/.test(host)) return '';
+  if (!/[0-9a-zA-Z]/.test(host)) return '';
+  return host;
+}
 
-			<table class="table">
-					<thead>
-						<tr>
-							<th>聚合通用分享链接 (可直接导入客户端)：</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td><button class="btn btn-primary" onclick="copyToClipboard('${wk\u0076\u006c\u0065\u0073\u0073share}')">点击复制链接</button></td>
-						</tr>
-					</tbody>
-				</table>
+function normalizeCountry(value) {
+  const text = String(value == null ? '' : value).trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(text) ? text : 'ZZ';
+}
 
+function normalizeCity(value) {
+  return String(value == null ? '' : value).trim().toUpperCase().slice(0, 8);
+}
 
-   
-			<table class="table">
-					<thead>
-						<tr>
-							<th>聚合通用订阅链接：</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td class="limited-width">${ty}</td>	
-							<td><button class="btn btn-primary" onclick="copyToClipboard('${ty}')">点击复制链接</button></td>
-						</tr>
-					</tbody>
-				</table>	
+// 带宽 + 延迟 的综合评分（0 ~ 100）
+function scoreOf(speed, latency) {
+  const bandwidth = Math.sqrt(clamp(speed, 0, SPEED_BENCH) / SPEED_BENCH);
+  const delay = 1 - clamp((latency - LATENCY_FLOOR) / (LATENCY_CEIL - LATENCY_FLOOR), 0, 1);
+  return Math.round((bandwidth * 50 + delay * 50) * 10) / 10;
+}
 
-				<table class="table">
-						<thead>
-							<tr>
-								<th>Clash-meta订阅链接：</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td class="limited-width">${cl}</td>	
-								<td><button class="btn btn-primary" onclick="copyToClipboard('${cl}')">点击复制链接</button></td>
-							</tr>
-						</tbody>
-					</table>
+function makeEntry(source) {
+  const ip = normalizeHost(source.ip);
+  const port = Number(source.port);
+  if (!ip || !Number.isInteger(port) || port < 1 || port > 65535) return null;
 
-					<table class="table">
-					<thead>
-						<tr>
-							<th>Sing-box订阅链接：</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td class="limited-width">${sb}</td>	
-							<td><button class="btn btn-primary" onclick="copyToClipboard('${sb}')">点击复制链接</button></td>
-						</tr>
-					</tbody>
-				</table>
-				<br>
-				<br>
-        </div>
-    </div>
-</div>
-</body>
-`;
-  } else {
-    return `
-<br>
-<br>
-${displayHtml}
-<body>
-<div class="container">
-    <div class="row">
-        <div class="col-md-12">
-            <h1>Cloudflare-workers/pages-\u0076\u006c\u0065\u0073\u0073代理脚本 V25.5.27</h1>
-			<hr>
-            <p>${noteshow}</p>
-            <hr>
-			<hr>
-			<hr>
-            <br>
-            <br>
-            <table class="table">
-						<thead>
-							<tr>
-								<th>Clash-meta/Verge订阅链接（推荐）：</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td class="limited-width">${pcl}</td>	
-								<td><button class="btn btn-primary" onclick="copyToClipboard('${pcl}')">点击复制链接</button></td>
-							</tr>
-						</tbody>
-					</table>
-					<table class="table">
-						<thead>
-							<tr>
-								<th>Clash客户端下载（推荐）：</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td class="limited-width">蓝奏云下载，密码1234</td>	
-								<td><button class="btn btn-primary"
-        onclick="window.open('https://wwbcm.lanzouq.com/b00hrk8eib', '_blank')">
-  点击打开
-</button></td>
-							</tr>
-						</tbody>
-					</table>
-					<table class="table">
-						<thead>
-							<tr>
-								<th>Clash旧订阅链接：</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td class="limited-width">${cl}</td>	
-								<td><button class="btn btn-primary" onclick="copyToClipboard('${cl}')">点击复制链接</button></td>
-							</tr>
-						</tbody>
-					</table>
-					<br>
-					<br>
-            <h3>1：CF-pages/workers/自定义域-\u0076\u006c\u0065\u0073\u0073+ws+tls节点</h3>
-			<table class="table">
-				<thead>
-					<tr>
-						<th>节点特色：</th>
-						<th>单节点链接如下：</th>
-					</tr>
-				</thead>
-				<tbody>
-					<tr>
-						<td class="limited-width">启用了TLS加密，<br>如果客户端支持分片(Fragment)功能，可开启，防止域名阻断</td>
-						<td class="limited-width">${p\u0076\u006c\u0065\u0073\u0073wstls}</td>
-						<td><button class="btn btn-primary" onclick="copyToClipboard('${p\u0076\u006c\u0065\u0073\u0073wstls}')">点击复制链接</button></td>
-					</tr>
-				</tbody>
-			</table>
-            <h5>客户端参数如下：</h5>
-            <ul>
-                <li>客户端地址(address)：自定义的域名 或者 优选域名 或者 优选IP 或者 反代IP</li>
-                <li>端口(port)：6个https端口可任意选择(443、8443、2053、2083、2087、2096)，或反代IP对应端口</li>
-                <li>用户ID(uuid)：${userID}</li>
-                <li>传输协议(network)：ws 或者 websocket</li>
-                <li>伪装域名(host)：${hostName}</li>
-                <li>路径(path)：/?ed=2560</li>
-                <li>传输安全(TLS)：开启</li>
-                <li>跳过证书验证(allowlnsecure)：false</li>
-			</ul>
-            <hr>
-			<hr>
-			<hr>
-            <br>
-            <br>
-			<h3>2：聚合通用、Clash-meta、Sing-box订阅链接如下：</h3>
-			<hr>
-			<p>注意：以下订阅链接仅6个TLS端口节点</p>
-			<hr>
+  const speed = clampNumber(source.speed, 0, 100000);
+  const tlsLatency = clampNumber(source.tls, 0, 100000);
+  const tcpLatency = clampNumber(source.tcp, 0, 100000);
+  const latency = tlsLatency || tcpLatency || LATENCY_CEIL;
 
+  return {
+    ip,
+    port,
+    speed,
+    latency,
+    tcpLatency,
+    country: normalizeCountry(source.country),
+    city: normalizeCity(source.city),
+    tls: TLS_PORTS.has(port),
+    score: scoreOf(speed, latency),
+  };
+}
 
-			<table class="table">
-					<thead>
-						<tr>
-							<th>聚合通用分享链接 (可直接导入客户端)：</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td><button class="btn btn-primary" onclick="copyToClipboard('${pg\u0076\u006c\u0065\u0073\u0073share}')">点击复制链接</button></td>
-						</tr>
-					</tbody>
-				</table>
+const CSV_COLUMNS = {
+  ip: /^(ip|地址|主机|host|server|node)$/i,
+  port: /端口|port/i,
+  speed: /速度|带宽|speed|mbps|rate/i,
+  country: /归属国|国家|地区|country|region|geo/i,
+  city: /机房|城市|city|datacenter|location/i,
+  tcp: /tcp/i,
+  tls: /tls|ssl|handshake|握手/i,
+};
 
+function splitCsvLine(line) {
+  const cells = [];
+  let current = '';
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (quoted) {
+      if (char === '"') {
+        if (line[index + 1] === '"') {
+          current += '"';
+          index += 1;
+        } else {
+          quoted = false;
+        }
+      } else {
+        current += char;
+      }
+    } else if (char === '"') {
+      quoted = true;
+    } else if (char === ',') {
+      cells.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
+}
 
+function csvColumnIndexes(cells) {
+  const map = {};
+  cells.forEach((cell, index) => {
+    const name = String(cell || '').trim();
+    if (!name) return;
+    for (const key of Object.keys(CSV_COLUMNS)) {
+      if (map[key] === undefined && CSV_COLUMNS[key].test(name)) map[key] = index;
+    }
+  });
+  return map;
+}
 
-			<table class="table">
-					<thead>
-						<tr>
-							<th>聚合通用订阅链接：</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td class="limited-width">${pty}</td>	
-							<td><button class="btn btn-primary" onclick="copyToClipboard('${pty}')">点击复制链接</button></td>
-						</tr>
-					</tbody>
-				</table>	
+function looksLikeCsvHeader(cells) {
+  if (cells.length < 3) return false;
+  return cells.some((cell) => CSV_COLUMNS.port.test(cell) || CSV_COLUMNS.speed.test(cell));
+}
 
-				<table class="table">
-						<thead>
-							<tr>
-								<th>Clash-meta订阅链接：</th>
-							</tr>
-						</thead>
-						<tbody>
-							<tr>
-								<td class="limited-width">${pcl}</td>	
-								<td><button class="btn btn-primary" onclick="copyToClipboard('${pcl}')">点击复制链接</button></td>
-							</tr>
-						</tbody>
-					</table>
+// result.csv：IP,cf-meta-ip,端口,速度(Mbps),CF归属国,机房,TCP延迟(ms),TLS延迟(ms)
+function parseCsvRows(lines) {
+  const entries = [];
+  let indexes = { ip: 0, port: 2, speed: 3, country: 4, city: 5, tcp: 6, tls: 7 };
+  let start = 0;
 
-					<table class="table">
-					<thead>
-						<tr>
-							<th>Sing-box订阅链接：</th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr>
-							<td class="limited-width">${psb}</td>	
-							<td><button class="btn btn-primary" onclick="copyToClipboard('${psb}')">点击复制链接</button></td>
-						</tr>
-					</tbody>
-				</table>
-				<br>
-				<br>
-        </div>
-    </div>
-</div>
-</body>
-`;
+  if (lines.length) {
+    const headerCells = splitCsvLine(lines[0]);
+    if (looksLikeCsvHeader(headerCells)) {
+      indexes = csvColumnIndexes(headerCells);
+      if (indexes.ip === undefined) indexes.ip = 0;
+      if (indexes.port === undefined) return entries;
+      start = 1;
+    }
+  }
+
+  for (let index = start; index < lines.length; index += 1) {
+    const cells = splitCsvLine(lines[index]);
+    if (cells.length < 2) continue;
+    const pick = (key) => (indexes[key] === undefined ? '' : cells[indexes[key]]);
+    const entry = makeEntry({
+      ip: pick('ip'),
+      port: pick('port'),
+      speed: pick('speed'),
+      country: pick('country'),
+      city: pick('city'),
+      tcp: pick('tcp'),
+      tls: pick('tls'),
+    });
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+// 兜底格式：1.2.3.4:443  /  1.2.3.4,443,12.5,88  /  host:8443#HK  /  [2400:cb00::1]:443
+function parsePlainRows(lines) {
+  const entries = [];
+  for (const line of lines) {
+    const text = String(line || '').trim();
+    if (!text || text.startsWith('#') || text.startsWith('//')) continue;
+    if (/^(vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic):\/\//i.test(text)) continue;
+
+    let ip = '';
+    let port = '';
+    let rest = '';
+    const bracketed = text.match(/^\[([0-9a-fA-F:]+)\][:,]\s*(\d{1,5})\b([\s\S]*)$/);
+    if (bracketed) {
+      [, ip, port, rest] = bracketed;
+    } else {
+      const plain = text.match(/^([0-9a-zA-Z.\-]+)[:,]\s*(\d{1,5})\b([\s\S]*)$/);
+      if (!plain) continue;
+      [, ip, port, rest] = plain;
+    }
+
+    const numbers = (rest.match(/\d+(?:\.\d+)?/g) || []).map(Number);
+    const entry = makeEntry({
+      ip,
+      port,
+      speed: numbers[0] || 0,
+      country: (rest.match(/[#|,]\s*([A-Za-z]{2})\b/) || [])[1] || '',
+      city: '',
+      tcp: numbers[1] || 0,
+      tls: '',
+    });
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+function parseEntries(text) {
+  const lines = String(text || '')
+    .replace(/^\uFEFF/, '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'));
+
+  if (!lines.length) return [];
+  const csvEntries = parseCsvRows(lines);
+  if (csvEntries.length) return csvEntries;
+  return parsePlainRows(lines);
+}
+
+function sourceCandidates(source) {
+  const value = String(source || '').trim();
+  if (!value) return [];
+
+  const blob = value.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/i);
+  if (blob) return [`https://raw.githubusercontent.com/${blob[1]}/${blob[2]}/${blob[3]}/${blob[4]}`, value];
+
+  const repo = value.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/?#]+)\/?$/i);
+  if (repo) {
+    const [, owner, name] = repo;
+    return [
+      `https://raw.githubusercontent.com/${owner}/${name}/main/result.csv`,
+      `https://raw.githubusercontent.com/${owner}/${name}/master/result.csv`,
+      `https://cdn.jsdelivr.net/gh/${owner}/${name}@main/result.csv`,
+      `https://cdn.jsdelivr.net/gh/${owner}/${name}@master/result.csv`,
+    ];
+  }
+
+  if (/^https?:\/\//i.test(value)) return [value];
+  return [`https://${value.replace(/^\/+/, '')}`];
+}
+
+async function fetchText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SOURCE_TIMEOUT);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (compatible; cf-node-sub/1.0)',
+        accept: 'text/csv,text/plain,*/*',
+      },
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-function gettyConfig(userID, hostName) {
-	const \u0076\u006c\u0065\u0073\u0073share = btoa(`\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP1}:${PT1}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V1_${IP1}_${PT1}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP2}:${PT2}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V2_${IP2}_${PT2}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP3}:${PT3}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V3_${IP3}_${PT3}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP4}:${PT4}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V4_${IP4}_${PT4}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP5}:${PT5}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V5_${IP5}_${PT5}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP6}:${PT6}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V6_${IP6}_${PT6}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP7}:${PT7}?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V7_${IP7}_${PT7}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP8}:${PT8}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V8_${IP8}_${PT8}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP9}:${PT9}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V9_${IP9}_${PT9}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP10}:${PT10}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V10_${IP10}_${PT10}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP11}:${PT11}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V11_${IP11}_${PT11}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP12}:${PT12}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V12_${IP12}_${PT12}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP13}:${PT13}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V13_${IP13}_${PT13}`);
-		return `${\u0076\u006c\u0065\u0073\u0073share}`
-	}
+async function loadEntries() {
+  const errors = [];
+  for (const source of NODE_SOURCES) {
+    for (const candidate of sourceCandidates(source)) {
+      try {
+        const text = await fetchText(candidate);
+        const entries = parseEntries(text);
+        if (entries.length) {
+          lastSnapshot = { entries, sourceUrl: candidate, fetchedAt: Date.now(), cached: false };
+          return lastSnapshot;
+        }
+        errors.push(candidate + '：没有解析到节点');
+      } catch (error) {
+        errors.push(candidate + '：' + ((error && error.message) || error));
+      }
+    }
+  }
+  if (lastSnapshot) return { ...lastSnapshot, cached: true, errors };
+  throw new Error('节点数据获取失败，' + errors.join('；'));
+}
 
-function getclConfig(userID, hostName) {
-return `
-port: 7890
+function countryFlag(code) {
+  if (!/^[A-Z]{2}$/.test(code) || code === 'ZZ') return '🌐';
+  return String.fromCodePoint(
+    ...[...code].map((char) => 0x1f1e6 + char.charCodeAt(0) - 65),
+  );
+}
+
+function regionLabel(code) {
+  return REGION_NAMES[code] || code;
+}
+
+function nodeName(entry, index) {
+  const region = REGION_NAMES[entry.country] || entry.country;
+  const city = CITY_NAMES[entry.city] || entry.city;
+  return `${countryFlag(entry.country)} ${region}${city ? '·' + city : ''} ${index}`;
+}
+
+// 每个地区取评分最高的 PER_REGION 个；地区之间按该地区最高分排序
+function selectNodes(entries, hostName) {
+  const unique = new Map();
+  for (const entry of entries) {
+    if (entry.latency > MAX_LATENCY) continue;
+    const key = entry.ip + '|' + entry.port;
+    const current = unique.get(key);
+    if (!current || entry.score > current.score) unique.set(key, entry);
+  }
+
+  const buckets = new Map();
+  for (const entry of unique.values()) {
+    if (!buckets.has(entry.country)) buckets.set(entry.country, []);
+    buckets.get(entry.country).push(entry);
+  }
+
+  const regions = [];
+  for (const [code, list] of buckets) {
+    list.sort((a, b) => b.score - a.score || a.latency - b.latency);
+    regions.push({
+      code,
+      name: regionLabel(code),
+      flag: countryFlag(code),
+      nodes: [],
+      list: list.slice(0, PER_REGION),
+    });
+  }
+  regions.sort((a, b) => b.list[0].score - a.list[0].score || b.list.length - a.list.length || a.code.localeCompare(b.code));
+
+  const nodes = [];
+  for (const region of regions) {
+    region.list.forEach((entry, index) => {
+      const node = {
+        name: nodeName(entry, index + 1),
+        server: entry.ip,
+        port: entry.port,
+        uuid: userID,
+        host: hostName,
+        path: WS_PATH,
+        tls: entry.tls,
+        region: region.name,
+        flag: region.flag,
+        country: region.code,
+        city: entry.city,
+        speed: entry.speed,
+        latency: entry.latency,
+        score: entry.score,
+      };
+      region.nodes.push(node);
+      nodes.push(node);
+    });
+  }
+
+  const finalNodes = nodes.slice(0, MAX_NODES);
+
+  // 保证订阅里至少有一个落在 100~200ms 的节点（其余节点仍按评分挑）
+  const usedEndpoints = new Set(finalNodes.map((node) => node.server + '|' + node.port));
+  const band = entries
+    .filter((entry) => entry.latency >= TARGET_LATENCY_MIN && entry.latency <= TARGET_LATENCY_MAX && !usedEndpoints.has(entry.ip + '|' + entry.port))
+    .sort((a, b) => b.score - a.score)[0];
+  if (band) {
+    finalNodes.push({
+      name: '🎯 ' + Math.round(band.latency) + 'ms · ' + band.country,
+      server: band.ip,
+      port: band.port,
+      uuid: userID,
+      host: hostName,
+      path: WS_PATH,
+      tls: band.tls,
+      region: '指定延迟',
+      flag: '🎯',
+      country: band.country,
+      city: band.city,
+      speed: band.speed,
+      latency: band.latency,
+      score: band.score,
+    });
+  }
+
+  return { nodes: finalNodes, regions, total: entries.length };
+}
+
+// 自动优化线路：直接用部署域名连（CF 会把你带到最近的边缘节点），不依赖第三方优选 IP
+function buildHostNodes(hostName) {
+  if (!INCLUDE_HOST_NODES) return [];
+  return HOST_PORTS.map((port) => ({
+    name: '🇨🇳 自动优化线路·' + port,
+    server: hostName,
+    port,
+    uuid: userID,
+    host: hostName,
+    path: WS_PATH,
+    tls: true,
+    region: '自动优化线路',
+    flag: '🇨🇳',
+    country: 'CN',
+    city: '',
+    speed: 0,
+    latency: 0,
+    score: 0,
+    hostNode: true,
+  }));
+}
+
+// 0 号：旧项目里的 visa 优选域名（Cloudflare 托管的真实站点，按 SNI 路由到本 Worker）
+function buildVisaNodes(hostName) {
+  if (!INCLUDE_VISA_NODES) return [];
+  return VISA_NODES.map(([server, port], index) => ({
+    name: '0️⃣ visa优化·' + (index + 1),
+    server,
+    port,
+    uuid: userID,
+    host: hostName,
+    path: WS_PATH,
+    tls: TLS_PORTS.has(port),
+    region: 'visa优化',
+    flag: '0️⃣',
+    country: 'VISA',
+    city: '',
+    speed: 0,
+    latency: 0,
+    score: 0,
+    visaNode: true,
+  }));
+}
+
+async function buildContext(request) {
+  const hostName = request.headers.get('Host') || new URL(request.url).host;
+
+  // 数据源挂了也不至于整份订阅失效：还有本机入口节点可用
+  let snapshot;
+  try {
+    snapshot = await loadEntries();
+  } catch (error) {
+    snapshot = {
+      entries: [],
+      sourceUrl: '',
+      fetchedAt: Date.now(),
+      cached: false,
+      error: (error && error.message) || String(error),
+    };
+  }
+
+  const selected = selectNodes(snapshot.entries, hostName);
+  const hostNodes = buildHostNodes(hostName);
+  const visaNodes = buildVisaNodes(hostName);
+  if (!selected.nodes.length && !hostNodes.length) {
+    throw new Error(snapshot.error || '没有可用节点');
+  }
+
+  return {
+    hostName,
+    // 本机入口放最前面：优选 IP 常常整批失效，客户端默认就能先连上可用的
+    // 0 号 visa → 自动优化线路 → 各地区（同国家相邻，保持评分顺序）
+    nodes: visaNodes.concat(hostNodes).concat(selected.nodes),
+    hostNodes,
+    visaNodes,
+    regions: selected.regions,
+    unique: new Set(snapshot.entries.map((entry) => entry.ip + '|' + entry.port)).size,
+    sourceUrl: snapshot.sourceUrl,
+    fetchedAt: snapshot.fetchedAt,
+    expireAt: Math.floor(Date.now() / 1000) + EXPIRE_SECONDS,
+    stale: Boolean(snapshot.cached),
+    sourceError: snapshot.error || '',
+  };
+}
+
+/* ==========================================================================
+ * Clash 订阅（YAML）
+ * ========================================================================== */
+
+const CFW_BASE = `port: 7890
+socks-port: 7891
 allow-lan: true
+bind-address: '*'
 mode: rule
 log-level: info
-unified-delay: true
-global-client-fingerprint: chrome
+external-controller: 127.0.0.1:9090
 dns:
-  enable: false
-  listen: :53
-  ipv6: true
+  enable: true
+  ipv6: false
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
-  default-nameserver: 
-    - 223.5.5.5
-    - 114.114.114.114
-    - 8.8.8.8
+  # 节点域名必须走真实解析：它一旦进 fake-ip，Clash 就没法连自己的服务器
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - '__HOST__'
   nameserver:
-    - https://dns.alidns.com/dns-query
+    - 223.5.5.5
+    - 119.29.29.29
     - https://doh.pub/dns-query
-  fallback:
-    - https://1.0.0.1/dns-query
-    - tls://dns.google
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
+  # 不写 fallback：境外 DoH（1.0.0.1 / dns.cloudflare.com）在国内会超时，
+  # 一旦 fallback 被触发，节点域名就解析不出来（日志里 all DNS requests failed 就是这个）
+`;
 
-proxies:
-- name: CF_V1_${IP1}_${PT1}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP1.replace(/[\[\]]/g, '')}
-  port: ${PT1}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V2_${IP2}_${PT2}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP2.replace(/[\[\]]/g, '')}
-  port: ${PT2}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V3_${IP3}_${PT3}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP3.replace(/[\[\]]/g, '')}
-  port: ${PT3}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V4_${IP4}_${PT4}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP4.replace(/[\[\]]/g, '')}
-  port: ${PT4}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V5_${IP5}_${PT5}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP5.replace(/[\[\]]/g, '')}
-  port: ${PT5}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V6_${IP6}_${PT6}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP6.replace(/[\[\]]/g, '')}
-  port: ${PT6}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V7_${IP7}_${PT7}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP7.replace(/[\[\]]/g, '')}
-  port: ${PT7}
-  uuid: ${userID}
-  udp: false
-  tls: false
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V8_${IP8}_${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP8.replace(/[\[\]]/g, '')}
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V9_${IP9}_${PT9}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP9.replace(/[\[\]]/g, '')}
-  port: ${PT9}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V10_${IP10}_${PT10}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP10.replace(/[\[\]]/g, '')}
-  port: ${PT10}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V11_${IP11}_${PT11}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP11.replace(/[\[\]]/g, '')}
-  port: ${PT11}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V12_${IP12}_${PT12}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP12.replace(/[\[\]]/g, '')}
-  port: ${PT12}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: CF_V13_${IP13}_${PT13}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP13.replace(/[\[\]]/g, '')}
-  port: ${PT13}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-proxy-groups:
-- name: 负载均衡
-  type: load-balance
-  url: http://www.gstatic.com/generate_204
-  interval: 300
-  proxies:
-    - CF_V1_${IP1}_${PT1}
-    - CF_V2_${IP2}_${PT2}
-    - CF_V3_${IP3}_${PT3}
-    - CF_V4_${IP4}_${PT4}
-    - CF_V5_${IP5}_${PT5}
-    - CF_V6_${IP6}_${PT6}
-    - CF_V7_${IP7}_${PT7}
-    - CF_V8_${IP8}_${PT8}
-    - CF_V9_${IP9}_${PT9}
-    - CF_V10_${IP10}_${PT10}
-    - CF_V11_${IP11}_${PT11}
-    - CF_V12_${IP12}_${PT12}
-    - CF_V13_${IP13}_${PT13}
-
-- name: 自动选择
-  type: url-test
-  url: http://www.gstatic.com/generate_204
-  interval: 300
-  tolerance: 50
-  proxies:
-    - CF_V1_${IP1}_${PT1}
-    - CF_V2_${IP2}_${PT2}
-    - CF_V3_${IP3}_${PT3}
-    - CF_V4_${IP4}_${PT4}
-    - CF_V5_${IP5}_${PT5}
-    - CF_V6_${IP6}_${PT6}
-    - CF_V7_${IP7}_${PT7}
-    - CF_V8_${IP8}_${PT8}
-    - CF_V9_${IP9}_${PT9}
-    - CF_V10_${IP10}_${PT10}
-    - CF_V11_${IP11}_${PT11}
-    - CF_V12_${IP12}_${PT12}
-    - CF_V13_${IP13}_${PT13}
-
-- name: 🌍选择代理
-  type: select
-  proxies:
-    - 负载均衡
-    - 自动选择
-    - DIRECT
-    - CF_V1_${IP1}_${PT1}
-    - CF_V2_${IP2}_${PT2}
-    - CF_V3_${IP3}_${PT3}
-    - CF_V4_${IP4}_${PT4}
-    - CF_V5_${IP5}_${PT5}
-    - CF_V6_${IP6}_${PT6}
-    - CF_V7_${IP7}_${PT7}
-    - CF_V8_${IP8}_${PT8}
-    - CF_V9_${IP9}_${PT9}
-    - CF_V10_${IP10}_${PT10}
-    - CF_V11_${IP11}_${PT11}
-    - CF_V12_${IP12}_${PT12}
-    - CF_V13_${IP13}_${PT13}
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,🌍选择代理`
-}
-	
-function getsbConfig(userID, hostName) {
-return `{
-	  "log": {
-		"disabled": false,
-		"level": "info",
-		"timestamp": true
-	  },
-	  "experimental": {
-		"clash_api": {
-		  "external_controller": "127.0.0.1:9090",
-		  "external_ui": "ui",
-		  "external_ui_download_url": "",
-		  "external_ui_download_detour": "",
-		  "secret": "",
-		  "default_mode": "Rule"
-		},
-		"cache_file": {
-		  "enabled": true,
-		  "path": "cache.db",
-		  "store_fakeip": true
-		}
-	  },
-	  "dns": {
-		"servers": [
-		  {
-			"tag": "proxydns",
-			"address": "tls://8.8.8.8/dns-query",
-			"detour": "select"
-		  },
-		  {
-			"tag": "localdns",
-			"address": "h3://223.5.5.5/dns-query",
-			"detour": "direct"
-		  },
-		  {
-			"tag": "dns_fakeip",
-			"address": "fakeip"
-		  }
-		],
-		"rules": [
-		  {
-			"outbound": "any",
-			"server": "localdns",
-			"disable_cache": true
-		  },
-		  {
-			"clash_mode": "Global",
-			"server": "proxydns"
-		  },
-		  {
-			"clash_mode": "Direct",
-			"server": "localdns"
-		  },
-		  {
-			"rule_set": "geosite-cn",
-			"server": "localdns"
-		  },
-		  {
-			"rule_set": "geosite-geolocation-!cn",
-			"server": "proxydns"
-		  },
-		  {
-			"rule_set": "geosite-geolocation-!cn",
-			"query_type": [
-			  "A",
-			  "AAAA"
-			],
-			"server": "dns_fakeip"
-		  }
-		],
-		"fakeip": {
-		  "enabled": true,
-		  "inet4_range": "198.18.0.0/15",
-		  "inet6_range": "fc00::/18"
-		},
-		"independent_cache": true,
-		"final": "proxydns"
-	  },
-	  "inbounds": [
-		{
-		  "type": "tun",
-                  "tag": "tun-in",
-		  "address": [
-                    "172.19.0.1/30",
-		    "fd00::1/126"
-      ],
-		  "auto_route": true,
-		  "strict_route": true,
-		  "sniff": true,
-		  "sniff_override_destination": true,
-		  "domain_strategy": "prefer_ipv4"
-		}
-	  ],
-	  "outbounds": [
-		{
-		  "tag": "select",
-		  "type": "selector",
-		  "default": "auto",
-		  "outbounds": [
-			"auto",
-			"CF_V1_${IP1}_${PT1}",
-			"CF_V2_${IP2}_${PT2}",
-			"CF_V3_${IP3}_${PT3}",
-			"CF_V4_${IP4}_${PT4}",
-			"CF_V5_${IP5}_${PT5}",
-			"CF_V6_${IP6}_${PT6}",
-			"CF_V7_${IP7}_${PT7}",
-			"CF_V8_${IP8}_${PT8}",
-			"CF_V9_${IP9}_${PT9}",
-			"CF_V10_${IP10}_${PT10}",
-			"CF_V11_${IP11}_${PT11}",
-			"CF_V12_${IP12}_${PT12}",
-			"CF_V13_${IP13}_${PT13}"
-		  ]
-		},
-		{
-		  "server": "${IP1}",
-		  "server_port": ${PT1},
-		  "tag": "CF_V1_${IP1}_${PT1}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP2}",
-		  "server_port": ${PT2},
-		  "tag": "CF_V2_${IP2}_${PT2}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP3}",
-		  "server_port": ${PT3},
-		  "tag": "CF_V3_${IP3}_${PT3}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP4}",
-		  "server_port": ${PT4},
-		  "tag": "CF_V4_${IP4}_${PT4}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP5}",
-		  "server_port": ${PT5},
-		  "tag": "CF_V5_${IP5}_${PT5}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP6}",
-		  "server_port": ${PT6},
-		  "tag": "CF_V6_${IP6}_${PT6}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP7}",
-		  "server_port": ${PT7},
-		  "tag": "CF_V7_${IP7}_${PT7}",
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{     
-		  "server": "${IP8}",
-		  "server_port": ${PT8},
-		  "tag": "CF_V8_${IP8}_${PT8}",
-		  "tls": {
-			"enabled": true,
-			"server_name": "${hostName}",
-			"insecure": false,
-			"utls": {
-			  "enabled": true,
-			  "fingerprint": "chrome"
-			}
-		  },
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP9}",
-		  "server_port": ${PT9},
-		  "tag": "CF_V9_${IP9}_${PT9}",
-		  "tls": {
-			"enabled": true,
-			"server_name": "${hostName}",
-			"insecure": false,
-			"utls": {
-			  "enabled": true,
-			  "fingerprint": "chrome"
-			}
-		  },
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP10}",
-		  "server_port": ${PT10},
-		  "tag": "CF_V10_${IP10}_${PT10}",
-		  "tls": {
-			"enabled": true,
-			"server_name": "${hostName}",
-			"insecure": false,
-			"utls": {
-			  "enabled": true,
-			  "fingerprint": "chrome"
-			}
-		  },
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP11}",
-		  "server_port": ${PT11},
-		  "tag": "CF_V11_${IP11}_${PT11}",
-		  "tls": {
-			"enabled": true,
-			"server_name": "${hostName}",
-			"insecure": false,
-			"utls": {
-			  "enabled": true,
-			  "fingerprint": "chrome"
-			}
-		  },
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP12}",
-		  "server_port": ${PT12},
-		  "tag": "CF_V12_${IP12}_${PT12}",
-		  "tls": {
-			"enabled": true,
-			"server_name": "${hostName}",
-			"insecure": false,
-			"utls": {
-			  "enabled": true,
-			  "fingerprint": "chrome"
-			}
-		  },
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "server": "${IP13}",
-		  "server_port": ${PT13},
-		  "tag": "CF_V13_${IP13}_${PT13}",
-		  "tls": {
-			"enabled": true,
-			"server_name": "${hostName}",
-			"insecure": false,
-			"utls": {
-			  "enabled": true,
-			  "fingerprint": "chrome"
-			}
-		  },
-		  "packet_encoding": "packetaddr",
-		  "transport": {
-			"headers": {
-			  "Host": [
-				"${hostName}"
-			  ]
-			},
-			"path": "/?ed=2560",
-			"type": "ws"
-		  },
-		  "type": "\u0076\u006c\u0065\u0073\u0073",
-		  "uuid": "${userID}"
-		},
-		{
-		  "tag": "direct",
-		  "type": "direct"
-		},
-		{
-		  "tag": "auto",
-		  "type": "urltest",
-		  "outbounds": [
-			"CF_V1_${IP1}_${PT1}",
-			"CF_V2_${IP2}_${PT2}",
-			"CF_V3_${IP3}_${PT3}",
-			"CF_V4_${IP4}_${PT4}",
-			"CF_V5_${IP5}_${PT5}",
-			"CF_V6_${IP6}_${PT6}",
-			"CF_V7_${IP7}_${PT7}",
-			"CF_V8_${IP8}_${PT8}",
-			"CF_V9_${IP9}_${PT9}",
-			"CF_V10_${IP10}_${PT10}",
-			"CF_V11_${IP11}_${PT11}",
-			"CF_V12_${IP12}_${PT12}",
-			"CF_V13_${IP13}_${PT13}"
-		  ],
-		  "url": "https://www.gstatic.com/generate_204",
-		  "interval": "1m",
-		  "tolerance": 50,
-		  "interrupt_exist_connections": false
-		}
-	  ],
-	  "route": {
-		"rule_set": [
-		  {
-			"tag": "geosite-geolocation-!cn",
-			"type": "remote",
-			"format": "binary",
-			"url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-			"download_detour": "select",
-			"update_interval": "1d"
-		  },
-		  {
-			"tag": "geosite-cn",
-			"type": "remote",
-			"format": "binary",
-			"url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
-			"download_detour": "select",
-			"update_interval": "1d"
-		  },
-		  {
-			"tag": "geoip-cn",
-			"type": "remote",
-			"format": "binary",
-			"url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-			"download_detour": "select",
-			"update_interval": "1d"
-		  }
-		],
-		"auto_detect_interface": true,
-		"final": "select",
-		"rules": [
-                         {
-                        "inbound": "tun-in",
-                        "action": "sniff"
-                         },
-                          {
-                        "protocol": "dns",
-                           "action": "hijack-dns"
-                         },
-                        {
-                        "port": 443,
-                        "network": "udp",
-                        "action": "reject"
-                         },
-		  {
-			"clash_mode": "Direct",
-			"outbound": "direct"
-		  },
-		  {
-			"clash_mode": "Global",
-			"outbound": "select"
-		  },
-		  {
-			"rule_set": "geoip-cn",
-			"outbound": "direct"
-		  },
-		  {
-			"rule_set": "geosite-cn",
-			"outbound": "direct"
-		  },
-		  {
-			"ip_is_private": true,
-			"outbound": "direct"
-		  },
-		  {
-			"rule_set": "geosite-geolocation-!cn",
-			"outbound": "select"
-		  }
-		]
-	  },
-	  "ntp": {
-		"enabled": true,
-		"server": "time.apple.com",
-		"server_port": 123,
-		"interval": "30m",
-		"detour": "direct"
-	  }
-	}`
-}
-
-function getptyConfig(userID, hostName) {
-	const \u0076\u006c\u0065\u0073\u0073share = btoa(`\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP8}:${PT8}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V8_${IP8}_${PT8}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP9}:${PT9}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V9_${IP9}_${PT9}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP10}:${PT10}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V10_${IP10}_${PT10}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP11}:${PT11}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V11_${IP11}_${PT11}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP12}:${PT12}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V12_${IP12}_${PT12}\n\u0076\u006c\u0065\u0073\u0073\u003A//${userID}\u0040${IP13}:${PT13}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#CF_V13_${IP13}_${PT13}`);	
-		return `${\u0076\u006c\u0065\u0073\u0073share}`
-	}
-	
-function getpclConfig(userID, hostName) {
-return `
-port: 7890
+const CV_BASE = `mixed-port: 7890
 allow-lan: true
+bind-address: '*'
 mode: rule
 log-level: info
+ipv6: false
 unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
 global-client-fingerprint: chrome
+external-controller: 127.0.0.1:9090
+profile:
+  store-selected: true
+  store-fake-ip: true
 dns:
-  enable: false
-  listen: :53
-  ipv6: true
+  enable: true
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
-  default-nameserver: 
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - localhost.ptlogin2.qq.com
+  default-nameserver:
     - 223.5.5.5
-    - 114.114.114.114
-    - 8.8.8.8
+    - 119.29.29.29
   nameserver:
-    - https://dns.alidns.com/dns-query
+    - 223.5.5.5
     - https://doh.pub/dns-query
-  fallback:
-    - https://1.0.0.1/dns-query
-    - tls://dns.google
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
+  # 节点域名只用国内 DNS 解析，避免被墙的 DoH 拖死
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+`;
 
-proxies:
-- name: 🇺🇸 CF_V8_美国_${IP8}:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP8.replace(/[\[\]]/g, '')}
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
+const quoteYaml = (value) => JSON.stringify(String(value));
 
-- name: 🇲🇲 CF_V9_缅甸_${IP9}:${PT9}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP9.replace(/[\[\]]/g, '')}
-  port: ${PT9}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇹🇼 CF_V10_台湾_${IP10}:${PT10}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP10.replace(/[\[\]]/g, '')}
-  port: ${PT10}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇨🇭 CF_V11_瑞士_${IP11}:${PT11}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP11.replace(/[\[\]]/g, '')}
-  port: ${PT11}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇧🇷 CF_V12_巴西_${IP12}:${PT12}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP12.replace(/[\[\]]/g, '')}
-  port: ${PT12}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇪🇺 CF_V13_东南欧_${IP13}:${PT13}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: ${IP13.replace(/[\[\]]/g, '')}
-  port: ${PT13}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-      
-- name: 🇰🇷 CF_P1_韩国_www.visakorea.com:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: www.visakorea.com
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇷🇺 CF_P2_俄罗斯_russia.com:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: russia.com
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇸🇬 CF_P3_新加坡_singapore.com:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: singapore.com
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇲🇾 CF_P4_马来西亚_malaysia.com:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: malaysia.com
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇯🇵 CF_P5_日本_japan.com:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: japan.com
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇯🇵 CF_P6_日本_www.visa.co.jp:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: www.visa.co.jp
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇭🇰 CF_P7_香港_www.visa.com.hk:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: www.visa.com.hk
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇭🇰 CF_P8_香港_icook.hk:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: icook.hk
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-- name: 🇹🇼 CF_P9_台湾_icook.tw:${PT8}
-  type: \u0076\u006c\u0065\u0073\u0073
-  server: icook.tw
-  port: ${PT8}
-  uuid: ${userID}
-  udp: false
-  tls: true
-  network: ws
-  servername: ${hostName}
-  ws-opts:
-    path: "/?ed=2560"
-    headers:
-      Host: ${hostName}
-
-proxy-groups:
-- name: 负载均衡
-  type: load-balance
-  url: http://www.gstatic.com/generate_204
-  interval: 300
-  proxies:
-    - 🇺🇸 CF_V8_美国_${IP8}:${PT8}
-    - 🇲🇲 CF_V9_缅甸_${IP9}:${PT9}
-    - 🇹🇼 CF_V10_台湾_${IP10}:${PT10}
-    - 🇨🇭 CF_V11_瑞士_${IP11}:${PT11}
-    - 🇧🇷 CF_V12_巴西_${IP12}:${PT12}
-    - 🇪🇺 CF_V13_东南欧_${IP13}:${PT13}
-    - 🇰🇷 CF_P1_韩国_www.visakorea.com:${PT8}
-    - 🇷🇺 CF_P2_俄罗斯_russia.com:${PT8}
-    - 🇸🇬 CF_P3_新加坡_singapore.com:${PT8}
-    - 🇲🇾 CF_P4_马来西亚_malaysia.com:${PT8}
-    - 🇯🇵 CF_P5_日本_japan.com:${PT8}
-    - 🇯🇵 CF_P6_日本_www.visa.co.jp:${PT8}
-    - 🇭🇰 CF_P7_香港_www.visa.com.hk:${PT8}
-    - 🇭🇰 CF_P8_香港_icook.hk:${PT8}
-    - 🇹🇼 CF_P9_台湾_icook.tw:${PT8}
-
-- name: 自动选择
-  type: url-test
-  url: http://www.gstatic.com/generate_204
-  interval: 300
-  tolerance: 50
-  proxies:
-    - 🇺🇸 CF_V8_美国_${IP8}:${PT8}
-    - 🇲🇲 CF_V9_缅甸_${IP9}:${PT9}
-    - 🇹🇼 CF_V10_台湾_${IP10}:${PT10}
-    - 🇨🇭 CF_V11_瑞士_${IP11}:${PT11}
-    - 🇧🇷 CF_V12_巴西_${IP12}:${PT12}
-    - 🇪🇺 CF_V13_东南欧_${IP13}:${PT13}
-    - 🇰🇷 CF_P1_韩国_www.visakorea.com:${PT8}
-    - 🇷🇺 CF_P2_俄罗斯_russia.com:${PT8}
-    - 🇸🇬 CF_P3_新加坡_singapore.com:${PT8}
-    - 🇲🇾 CF_P4_马来西亚_malaysia.com:${PT8}
-    - 🇯🇵 CF_P5_日本_japan.com:${PT8}
-    - 🇯🇵 CF_P6_日本_www.visa.co.jp:${PT8}
-    - 🇭🇰 CF_P7_香港_www.visa.com.hk:${PT8}
-    - 🇭🇰 CF_P8_香港_icook.hk:${PT8}
-    - 🇹🇼 CF_P9_台湾_icook.tw:${PT8}
-
-- name: 🌍选择代理
-  type: select
-  proxies:
-    - 负载均衡
-    - 自动选择
-    - DIRECT
-    - 🇺🇸 CF_V8_美国_${IP8}:${PT8}
-    - 🇲🇲 CF_V9_缅甸_${IP9}:${PT9}
-    - 🇹🇼 CF_V10_台湾_${IP10}:${PT10}
-    - 🇨🇭 CF_V11_瑞士_${IP11}:${PT11}
-    - 🇧🇷 CF_V12_巴西_${IP12}:${PT12}
-    - 🇪🇺 CF_V13_东南欧_${IP13}:${PT13}
-    - 🇰🇷 CF_P1_韩国_www.visakorea.com:${PT8}
-    - 🇷🇺 CF_P2_俄罗斯_russia.com:${PT8}
-    - 🇸🇬 CF_P3_新加坡_singapore.com:${PT8}
-    - 🇲🇾 CF_P4_马来西亚_malaysia.com:${PT8}
-    - 🇯🇵 CF_P5_日本_japan.com:${PT8}
-    - 🇯🇵 CF_P6_日本_www.visa.co.jp:${PT8}
-    - 🇭🇰 CF_P7_香港_www.visa.com.hk:${PT8}
-    - 🇭🇰 CF_P8_香港_icook.hk:${PT8}
-    - 🇹🇼 CF_P9_台湾_icook.tw:${PT8}
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,🌍选择代理`
+function yamlProxy(node, kind) {
+  const vmess = kind === 'vmess';
+  const trojan = kind === 'trojan';
+  const lines = [
+    '- name: ' + quoteYaml(node.name),
+    '  type: ' + (vmess ? 'vmess' : (trojan ? 'trojan' : 'vless')),
+    '  server: ' + quoteYaml(node.server),
+    '  port: ' + node.port,
+    trojan ? '  password: ' + quoteYaml(TROJAN_PASSWORD) : '  uuid: ' + quoteYaml(node.uuid),
+  ];
+  if (vmess) lines.push('  alterId: 0', '  cipher: aes-128-gcm');
+  lines.push('  udp: false');
+  lines.push('  tls: ' + (node.tls ? 'true' : 'false'));
+  if (node.tls) lines.push((trojan ? '  sni: ' : '  servername: ') + quoteYaml(node.host));
+  // WebSocket 走 TLS 时必须只用 http/1.1：协商到 h2 时 Upgrade 会被拒，表现为节点连不上
+  if (node.tls) lines.push('  alpn:', '    - http/1.1');
+  if (vmess) lines.push('  skip-cert-verify: false');
+  else if (trojan) lines.push('  skip-cert-verify: false');
+  else lines.push('  client-fingerprint: chrome');
+  lines.push('  network: ws');
+  lines.push(
+    '  ws-opts:',
+    '    path: ' + quoteYaml(node.path),
+    '    headers:',
+    '      Host: ' + quoteYaml(node.host),
+  );
+  return lines.join('\n');
 }
-		
-function getpsbConfig(userID, hostName) {
-return `{
-		  "log": {
-			"disabled": false,
-			"level": "info",
-			"timestamp": true
-		  },
-		  "experimental": {
-			"clash_api": {
-			  "external_controller": "127.0.0.1:9090",
-			  "external_ui": "ui",
-			  "external_ui_download_url": "",
-			  "external_ui_download_detour": "",
-			  "secret": "",
-			  "default_mode": "Rule"
-			},
-			"cache_file": {
-			  "enabled": true,
-			  "path": "cache.db",
-			  "store_fakeip": true
-			}
-		  },
-		  "dns": {
-			"servers": [
-			  {
-				"tag": "proxydns",
-				"address": "tls://8.8.8.8/dns-query",
-				"detour": "select"
-			  },
-			  {
-				"tag": "localdns",
-				"address": "h3://223.5.5.5/dns-query",
-				"detour": "direct"
-			  },
-			  {
-				"tag": "dns_fakeip",
-				"address": "fakeip"
-			  }
-			],
-			"rules": [
-			  {
-				"outbound": "any",
-				"server": "localdns",
-				"disable_cache": true
-			  },
-			  {
-				"clash_mode": "Global",
-				"server": "proxydns"
-			  },
-			  {
-				"clash_mode": "Direct",
-				"server": "localdns"
-			  },
-			  {
-				"rule_set": "geosite-cn",
-				"server": "localdns"
-			  },
-			  {
-				"rule_set": "geosite-geolocation-!cn",
-				"server": "proxydns"
-			  },
-			  {
-				"rule_set": "geosite-geolocation-!cn",
-				"query_type": [
-				  "A",
-				  "AAAA"
-				],
-				"server": "dns_fakeip"
-			  }
-			],
-			"fakeip": {
-			  "enabled": true,
-			  "inet4_range": "198.18.0.0/15",
-			  "inet6_range": "fc00::/18"
-			},
-			"independent_cache": true,
-			"final": "proxydns"
-		  },
-		  "inbounds": [
-			{
-			  "type": "tun",
-                        "tag": "tun-in",
-		  "address": [
-                    "172.19.0.1/30",
-		    "fd00::1/126"
-      ],
-			  "auto_route": true,
-			  "strict_route": true,
-			  "sniff": true,
-			  "sniff_override_destination": true,
-			  "domain_strategy": "prefer_ipv4"
-			}
-		  ],
-		  "outbounds": [
-			{
-			  "tag": "select",
-			  "type": "selector",
-			  "default": "auto",
-			  "outbounds": [
-				"auto",
-				"CF_V8_${IP8}_${PT8}",
-				"CF_V9_${IP9}_${PT9}",
-				"CF_V10_${IP10}_${PT10}",
-				"CF_V11_${IP11}_${PT11}",
-				"CF_V12_${IP12}_${PT12}",
-				"CF_V13_${IP13}_${PT13}"
-			  ]
-			},
-			{
-			  "server": "${IP8}",
-			  "server_port": ${PT8},
-			  "tag": "CF_V8_${IP8}_${PT8}",
-			  "tls": {
-				"enabled": true,
-				"server_name": "${hostName}",
-				"insecure": false,
-				"utls": {
-				  "enabled": true,
-				  "fingerprint": "chrome"
-				}
-			  },
-			  "packet_encoding": "packetaddr",
-			  "transport": {
-				"headers": {
-				  "Host": [
-					"${hostName}"
-				  ]
-				},
-				"path": "/?ed=2560",
-				"type": "ws"
-			  },
-			  "type": "\u0076\u006c\u0065\u0073\u0073",
-			  "uuid": "${userID}"
-			},
-			{
-			  "server": "${IP9}",
-			  "server_port": ${PT9},
-			  "tag": "CF_V9_${IP9}_${PT9}",
-			  "tls": {
-				"enabled": true,
-				"server_name": "${hostName}",
-				"insecure": false,
-				"utls": {
-				  "enabled": true,
-				  "fingerprint": "chrome"
-				}
-			  },
-			  "packet_encoding": "packetaddr",
-			  "transport": {
-				"headers": {
-				  "Host": [
-					"${hostName}"
-				  ]
-				},
-				"path": "/?ed=2560",
-				"type": "ws"
-			  },
-			  "type": "\u0076\u006c\u0065\u0073\u0073",
-			  "uuid": "${userID}"
-			},
-			{
-			  "server": "${IP10}",
-			  "server_port": ${PT10},
-			  "tag": "CF_V10_${IP10}_${PT10}",
-			  "tls": {
-				"enabled": true,
-				"server_name": "${hostName}",
-				"insecure": false,
-				"utls": {
-				  "enabled": true,
-				  "fingerprint": "chrome"
-				}
-			  },
-			  "packet_encoding": "packetaddr",
-			  "transport": {
-				"headers": {
-				  "Host": [
-					"${hostName}"
-				  ]
-				},
-				"path": "/?ed=2560",
-				"type": "ws"
-			  },
-			  "type": "\u0076\u006c\u0065\u0073\u0073",
-			  "uuid": "${userID}"
-			},
-			{
-			  "server": "${IP11}",
-			  "server_port": ${PT11},
-			  "tag": "CF_V11_${IP11}_${PT11}",
-			  "tls": {
-				"enabled": true,
-				"server_name": "${hostName}",
-				"insecure": false,
-				"utls": {
-				  "enabled": true,
-				  "fingerprint": "chrome"
-				}
-			  },
-			  "packet_encoding": "packetaddr",
-			  "transport": {
-				"headers": {
-				  "Host": [
-					"${hostName}"
-				  ]
-				},
-				"path": "/?ed=2560",
-				"type": "ws"
-			  },
-			  "type": "\u0076\u006c\u0065\u0073\u0073",
-			  "uuid": "${userID}"
-			},
-			{
-			  "server": "${IP12}",
-			  "server_port": ${PT12},
-			  "tag": "CF_V12_${IP12}_${PT12}",
-			  "tls": {
-				"enabled": true,
-				"server_name": "${hostName}",
-				"insecure": false,
-				"utls": {
-				  "enabled": true,
-				  "fingerprint": "chrome"
-				}
-			  },
-			  "packet_encoding": "packetaddr",
-			  "transport": {
-				"headers": {
-				  "Host": [
-					"${hostName}"
-				  ]
-				},
-				"path": "/?ed=2560",
-				"type": "ws"
-			  },
-			  "type": "\u0076\u006c\u0065\u0073\u0073",
-			  "uuid": "${userID}"
-			},
-			{
-			  "server": "${IP13}",
-			  "server_port": ${PT13},
-			  "tag": "CF_V13_${IP13}_${PT13}",
-			  "tls": {
-				"enabled": true,
-				"server_name": "${hostName}",
-				"insecure": false,
-				"utls": {
-				  "enabled": true,
-				  "fingerprint": "chrome"
-				}
-			  },
-			  "packet_encoding": "packetaddr",
-			  "transport": {
-				"headers": {
-				  "Host": [
-					"${hostName}"
-				  ]
-				},
-				"path": "/?ed=2560",
-				"type": "ws"
-			  },
-			  "type": "\u0076\u006c\u0065\u0073\u0073",
-			  "uuid": "${userID}"
-			},
-			{
-			  "tag": "direct",
-			  "type": "direct"
-			},
-			{
-			  "tag": "auto",
-			  "type": "urltest",
-			  "outbounds": [
-				"CF_V8_${IP8}_${PT8}",
-				"CF_V9_${IP9}_${PT9}",
-				"CF_V10_${IP10}_${PT10}",
-				"CF_V11_${IP11}_${PT11}",
-				"CF_V12_${IP12}_${PT12}",
-				"CF_V13_${IP13}_${PT13}"
-			  ],
-			  "url": "https://www.gstatic.com/generate_204",
-			  "interval": "1m",
-			  "tolerance": 50,
-			  "interrupt_exist_connections": false
-			}
-		  ],
-		  "route": {
-			"rule_set": [
-			  {
-				"tag": "geosite-geolocation-!cn",
-				"type": "remote",
-				"format": "binary",
-				"url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
-				"download_detour": "select",
-				"update_interval": "1d"
-			  },
-			  {
-				"tag": "geosite-cn",
-				"type": "remote",
-				"format": "binary",
-				"url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
-				"download_detour": "select",
-				"update_interval": "1d"
-			  },
-			  {
-				"tag": "geoip-cn",
-				"type": "remote",
-				"format": "binary",
-				"url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
-				"download_detour": "select",
-				"update_interval": "1d"
-			  }
-			],
-			"auto_detect_interface": true,
-			"final": "select",
-			"rules": [
-                          {
-                         "inbound": "tun-in",
-                          "action": "sniff"
-                          },
-                          {
-                          "protocol": "dns",
-                          "action": "hijack-dns"
-                           },
-                          {
-                           "port": 443,
-                          "network": "udp",
-                          "action": "reject"
-                          },
-			  {
-				"clash_mode": "Direct",
-				"outbound": "direct"
-			  },
-			  {
-				"clash_mode": "Global",
-				"outbound": "select"
-			  },
-			  {
-				"rule_set": "geoip-cn",
-				"outbound": "direct"
-			  },
-			  {
-				"rule_set": "geosite-cn",
-				"outbound": "direct"
-			  },
-			  {
-				"ip_is_private": true,
-				"outbound": "direct"
-			  },
-			  {
-				"rule_set": "geosite-geolocation-!cn",
-				"outbound": "select"
-			  }
-			]
-		  },
-		  "ntp": {
-			"enabled": true,
-			"server": "time.apple.com",
-			"server_port": 123,
-			"interval": "30m",
-			"detour": "direct"
-		  }
-		}`;
-} 
+
+function isDomainNode(node) {
+  return Boolean(node.visaNode || node.hostNode) || /[a-z]/i.test(String(node.server));
+}
+
+function yamlGroups(nodes) {
+  const all = nodes.map((node) => '    - ' + quoteYaml(node.name));
+  const domainNodes = nodes.filter((node) => isDomainNode(node));
+  const ipNodes = nodes.filter((node) => !isDomainNode(node));
+  const groups = [];
+
+  groups.push([
+    '- name: 🚀 节点选择',
+    '  type: select',
+    '  proxies:',
+    '    - ⚡ 低延迟',
+    '    - ♻️ 自动选择',
+    '    - 🔁 自动优化',
+    '    - ⚖️ 负载均衡',
+    '    - 0️⃣ visa优化',
+    '    - DIRECT',
+    ...all,
+  ].join('\n'));
+
+  // 自动选择只放 IP 节点：域名节点（0 号 visa + 自动优化线路）单独进「自动优化」
+  if (ipNodes.length) {
+    groups.push([
+      '- name: ♻️ 自动选择',
+      '  type: url-test',
+      '  url: http://www.gstatic.com/generate_204',
+      '  interval: 300',
+      '  tolerance: 50',
+      '  proxies:',
+      ...ipNodes.map((node) => '    - ' + quoteYaml(node.name)),
+    ].join('\n'));
+  }
+
+  const fastNodes = ipNodes.filter((node) => node.latency <= 150);
+  if (fastNodes.length) {
+    groups.push([
+      '- name: ⚡ 低延迟',
+      '  type: url-test',
+      '  url: http://www.gstatic.com/generate_204',
+      '  interval: 120',
+      '  tolerance: 30',
+      '  proxies:',
+      ...fastNodes.map((node) => '    - ' + quoteYaml(node.name)),
+    ].join('\n'));
+  }
+
+  // 全部域名节点集中在这个组里自动测速选优
+  if (domainNodes.length) {
+    groups.push([
+      '- name: 🔁 自动优化',
+      '  type: url-test',
+      '  url: http://www.gstatic.com/generate_204',
+      '  interval: 120',
+      '  tolerance: 30',
+      '  proxies:',
+      ...domainNodes.map((node) => '    - ' + quoteYaml(node.name)),
+    ].join('\n'));
+  }
+
+  groups.push([
+    '- name: ⚖️ 负载均衡',
+    '  type: load-balance',
+    '  url: http://www.gstatic.com/generate_204',
+    '  interval: 300',
+    '  strategy: consistent-hashing',
+    '  proxies:',
+    ...all,
+  ].join('\n'));
+
+  const visaGroupNodes = nodes.filter((node) => node.visaNode);
+  if (visaGroupNodes.length) {
+    groups.push([
+      '- name: 0️⃣ visa优化',
+      '  type: select',
+      '  proxies:',
+      ...visaGroupNodes.map((node) => '    - ' + quoteYaml(node.name)),
+    ].join('\n'));
+  }
+
+
+  return 'proxy-groups:\n' + groups.join('\n');
+}
+
+function formatTime(timestamp) {
+  const date = new Date(timestamp + 8 * 3600 * 1000);
+  return date.toISOString().replace('T', ' ').slice(0, 19) + ' UTC+8';
+}
+
+function formatShortTime(timestamp) {
+  return new Date(timestamp + 8 * 3600 * 1000).toISOString().slice(5, 16).replace('T', ' ');
+}
+
+function formatTraffic(bytes) {
+  const value = bytes / 1024 ** 4;
+  return (Number.isInteger(value) ? String(value) : value.toFixed(1)) + ' T';
+}
+
+function yamlDocument(context, kind) {
+  const { nodes, regions, sourceUrl, fetchedAt, stale } = context;
+  const head = [
+    '# Cloudflare Pages 自动生成 · ' + formatTime(fetchedAt),
+    '# 数据源 ' + (sourceUrl || '-') + (stale ? '（上游暂时不可用，已使用上次成功的数据）' : (context.sourceError ? '（上游暂时不可用）' : '')),
+    '# 节点 ' + nodes.length + ' 个（0️⃣ visa ' + context.visaNodes.length + ' 个 + 🇨🇳 自动优化线路 ' + context.hostNodes.length + ' 个）· 地区 ' + regions.length + ' 个 · 每地区最多 ' + PER_REGION + ' 个',
+    '# 排序依据：带宽 + 延迟综合评分，同地区只保留评分最高的几个',
+    '# 订阅流量 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / ' + formatTraffic(TRAFFIC_TOTAL_BYTES) +
+      ' · 到期 ' + formatTime(context.expireAt * 1000),
+    '# 协议 ' + (kind === 'vmess' ? 'VMess + WS + TLS（Clash for Windows 可用）' : (kind === 'trojan' ? 'Trojan + WS + TLS（CFW / Verge 都可用）' : 'VLESS + WS + TLS（Clash Verge / Mihomo）')),
+    '',
+  ];
+
+  const rules = [
+    'rules:',
+    '  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
+    '  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
+    '  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
+    '  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+    '  - GEOIP,CN,DIRECT',
+    '  - MATCH,🚀 节点选择',
+  ];
+
+  return head.concat([
+    (kind === 'vless' ? CV_BASE : CFW_BASE).replace(/__HOST__/g, context.hostName),
+    '',
+    'proxies:',
+    nodes.map((node) => yamlProxy(node, kind)).join('\n\n'),
+    '',
+    yamlGroups(nodes),
+    '',
+  ], rules).join('\n') + '\n';
+}
+
+async function handleSubscription(request, kind) {
+  const context = await buildContext(request);
+  const body = yamlDocument(context, kind);
+  return new Response(body, {
+    status: 200,
+    headers: {
+      'content-type': 'text/yaml; charset=utf-8',
+      'cache-control': 'no-store, max-age=0',
+      'content-disposition': 'inline; filename="' + kind + '.yaml"',
+      // 告诉客户端多久自动更新一次订阅（mihomo / Clash Verge 支持，单位小时）
+      'profile-update-interval': String(UPDATE_INTERVAL_HOURS),
+      'profile-web-page-url': 'https://' + context.hostName + '/' + PASSWORD + '/',
+      // 客户端显示的流量与到期时间（Stash / Clash Verge / Shadowrocket 等会读取）
+      'subscription-userinfo':
+        'upload=0; download=' + TRAFFIC_USED_BYTES +
+        '; total=' + TRAFFIC_TOTAL_BYTES + '; expire=' + context.expireAt,
+      'x-node-count': String(context.nodes.length),
+      'x-region-count': String(context.regions.length),
+      'x-generated-at': new Date().toISOString(),
+    },
+  });
+}
+
+/* ==========================================================================
+ * 面板
+ * ========================================================================== */
+
+const escapeHtml = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+}[char]));
+
+const PAGE_CSS = `
+:root{
+  --bg:#fbfbfa;--fg:#1b1b1a;--dim:#75756f;--line:#e6e5e0;--fill:#f1f0ea;
+  --ink:#1b1b1a;--inkfg:#fbfbfa;--shadow:0 10px 26px rgba(24,24,20,.10);
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#111110;--fg:#e7e7e3;--dim:#8b8b84;--line:#282826;--fill:#1a1a19;
+    --ink:#e7e7e3;--inkfg:#111110;--shadow:0 10px 26px rgba(0,0,0,.55);}
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased}
+main{max-width:640px;margin:0 auto;padding:34px 20px 76px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:.92em}
+header{display:flex;align-items:baseline;gap:10px}
+h1{margin:0;font-size:16px;font-weight:600;letter-spacing:.01em}
+.ver{font-size:11.5px;color:var(--dim);letter-spacing:.04em}
+.host{margin:6px 0 0;font-size:12.5px;color:var(--dim);word-break:break-all}
+section{margin-top:32px}
+h2{margin:0 0 8px;font-size:11.5px;font-weight:600;color:var(--dim);letter-spacing:.16em}
+.rows{border-top:1px solid var(--line)}
+.row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:7px 10px;padding:12px 0;border-bottom:1px solid var(--line)}
+.meta{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}
+.name{font-size:14px;font-weight:500;line-height:1.35}
+.tag{flex:none;font-size:11px;line-height:16px;padding:0 5px;color:var(--dim);border:1px solid var(--line);border-radius:4px}
+.act{display:flex;gap:6px;justify-self:end;flex-wrap:wrap;justify-content:flex-end}
+.val{grid-column:1/-1;min-width:0;color:var(--dim);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.val a{color:inherit;text-decoration:none;border-bottom:1px solid var(--line)}
+.flag{display:inline-flex;align-items:center;justify-content:center;width:20px;flex:none;font-size:14px;line-height:1;
+  font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif}
+.btn{display:inline-flex;align-items:center;justify-content:center;font:inherit;font-size:12.5px;line-height:1;
+  padding:7px 11px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--fg);
+  cursor:pointer;text-decoration:none;white-space:nowrap;user-select:none}
+.btn:hover{border-color:var(--dim)}
+.btn:active{transform:translateY(.5px)}
+.btn.solid{background:var(--ink);border-color:var(--ink);color:var(--inkfg)}
+.btn.solid:hover{opacity:.86;border-color:var(--ink)}
+.fold>summary{cursor:pointer;list-style:none;display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--dim);padding:10px 0}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary:hover{color:var(--fg)}
+.fold>summary::after{content:"\\25BE";font-size:9px;line-height:1;transition:transform .15s}
+.fold[open]>summary::after{transform:rotate(180deg)}
+.kv{width:100%;border-collapse:collapse;font-size:12.5px;margin:2px 0 0}
+.kv th{text-align:left;font-weight:500;color:var(--dim);padding:7px 8px 7px 0;border-bottom:1px solid var(--line);white-space:nowrap}
+.kv td{padding:7px 0;border-bottom:1px solid var(--line);word-break:break-all}
+.kv td.num{text-align:right;color:var(--dim);white-space:nowrap;padding-left:8px}
+.note{font-size:13px;line-height:1.8;color:var(--dim)}
+.note p{margin:0}
+.hint{margin:14px 0 0;font-size:12px;line-height:1.7;color:var(--dim)}
+.hint a{color:var(--fg);text-decoration:none;border-bottom:1px solid var(--line)}
+.stat{margin:10px 0 0;font-size:12px;color:var(--dim);display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}
+@media (max-width:430px){
+  .row{gap:6px 8px}
+  .btn{padding:6px 9px}
+  .act{grid-column:1/-1;justify-self:start}
+}
+`;
+
+const PAGE_JS = `(function () {
+  function fallbackCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0';
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (error) { ok = false; }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  document.addEventListener('click', function (event) {
+    var button = event.target.closest('[data-copy]');
+    if (!button) return;
+    var text = button.getAttribute('data-copy') || '';
+    var label = button.textContent;
+    var timer = null;
+    function done(message) {
+      button.textContent = message;
+      clearTimeout(timer);
+      timer = setTimeout(function () { button.textContent = label; }, 1400);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { done('已复制'); }, function () {
+        done(fallbackCopy(text) ? '已复制' : '复制失败');
+      });
+    } else {
+      done(fallbackCopy(text) ? '已复制' : '复制失败');
+    }
+  });
+})();`;
+
+function renderPanel(context) {
+  const { hostName, nodes, hostNodes, visaNodes, regions, total, unique, sourceUrl, fetchedAt, expireAt, stale, sourceError } = context;
+  const base = 'https://' + hostName + '/' + PASSWORD;
+  const sub = {
+    trojan: base + '/trojan',
+    vmess: base + '/vmess',
+    vless: base + '/vless',
+  };
+  const clashImport = (url) => 'clash://install-config?url=' + encodeURIComponent(url);
+
+  const subRow = (title, protocol, url) => `        <div class="row">
+          <div class="meta"><span class="name">${escapeHtml(title)}</span><span class="tag">${escapeHtml(protocol)}</span><span class="tag">${nodes.length} 个节点</span><span class="tag">${UPDATE_INTERVAL_HOURS}h 自动更新</span></div>
+          <div class="act"><a class="btn solid" href="${escapeHtml(clashImport(url))}">打开 Clash 导入</a><button class="btn" type="button" data-copy="${escapeHtml(url)}">复制订阅链接</button></div>
+          <div class="val mono"><a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a></div>
+        </div>`;
+
+  const regionRows = regions.map((region) => {
+    const best = region.nodes[0];
+    return `        <div class="row">
+          <div class="meta"><span class="flag">${escapeHtml(region.flag)}</span><span class="name">${escapeHtml(region.name)}</span><span class="tag">${escapeHtml(region.code)}</span></div>
+          <span class="tag">${region.nodes.length} 个 · ${best.latency.toFixed(0)}ms · ${best.speed.toFixed(1)}Mbps</span>
+          <div class="val">${escapeHtml(region.nodes.map((node) => node.name).join(' / '))}</div>
+        </div>`;
+  }).join('\n');
+
+  const nodeRows = nodes.filter((node) => !node.hostNode && !node.visaNode).map((node) => `        <tr>
+          <td>${escapeHtml(node.name)}</td>
+          <td class="num">${node.latency.toFixed(0)}ms</td>
+          <td class="num">${node.speed.toFixed(1)}M</td>
+          <td class="num">${node.score.toFixed(0)}</td>
+        </tr>`).join('\n');
+
+  const regionSection = regions.length ? `
+  <section>
+    <h2>地区 · 每区 ${PER_REGION} 个</h2>
+    <div class="rows">
+${regionRows}
+    </div>
+    <details class="fold">
+      <summary>全部 ${nodes.length - (hostNodes || []).length - (visaNodes || []).length} 个优选节点（延迟 / 带宽 / 评分）</summary>
+      <table class="kv">
+        <tr><th>节点</th><th>延迟</th><th>带宽</th><th>评分</th></tr>
+${nodeRows}
+      </table>
+    </details>
+  </section>` : `
+  <section>
+    <h2>地区</h2>
+    <p class="hint">数据源暂时不可用${sourceError ? '（' + escapeHtml(sourceError) + '）' : ''}，本次只有本机入口节点可用。</p>
+  </section>`;
+  const visaRows = (visaNodes || []).map((node) => `        <div class="row">
+          <div class="meta"><span class="flag">0️⃣</span><span class="name">${escapeHtml(node.name)}</span><span class="tag">${node.port}${node.tls ? ' · TLS' : ''}</span></div>
+          <span class="tag">visa 优选域名</span>
+          <div class="val mono">${escapeHtml(node.server)}:${node.port}</div>
+        </div>`).join('\n');
+
+  const hostRows = (hostNodes || []).map((node) => `        <div class="row">
+          <div class="meta"><span class="flag">🏠</span><span class="name">${escapeHtml(node.name)}</span><span class="tag">${node.port}</span></div>
+          <span class="tag">直连部署域名</span>
+          <div class="val mono">${escapeHtml(node.server)}:${node.port}</div>
+        </div>`).join('\n');
+
+  const notes = [
+    '每次打开或刷新页面、每次客户端更新订阅，都会重新抓取数据源并重新挑选节点，不做任何缓存（上游失败时才会退回上一次成功的数据）。',
+    '评分 = 带宽 50% + 延迟 50%；同一地区只保留评分最高的 ' + PER_REGION + ' 个，整个订阅最多 ' + MAX_NODES + ' 个。',
+    '三类协议共用同一批节点：/trojan（Trojan，CFW 与 Verge 都支持）、/vmess（Clash for Windows）、/vless（Clash Verge / Mihomo）；只有 VLESS 是 CFW 老内核不支持的。',
+    '访问 x.com / twitter.com 这类 Cloudflare 托管站点时会自动改走 proxyip 中转（Worker 的 connect() 不允许直连 CF 自己的 IP）；普通站点仍然直连，不绕路。',
+    '订阅里固定带一个 🎯 100~200ms 的节点，方便对照测速。',
+    '当前 Worker 同时是代理服务端，UUID 与面板密码都写死在代码里；转发落地依赖 Worker 的 NAT64 出口，无需设置 ProxyIP。',
+    '订阅响应带 profile-update-interval = ' + UPDATE_INTERVAL_HOURS + ' 小时，Clash Verge / mihomo 会按这个间隔自动更新；Clash for Windows 需要在「订阅」设置里自己填更新间隔。',
+    '客户端显示的「已用 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / 总量 ' + formatTraffic(TRAFFIC_TOTAL_BYTES) + '」「到期 24 小时后」来自 subscription-userinfo 响应头，每次刷新都会顺延到新的 24 小时，纯展示用，不影响节点使用。',
+    '节点 IP 来自第三方扫描结果，可用性会随时间变化；连不上时换同地区另一个节点即可。',
+    '订阅里还附带 🏠 本机·443 / 🏠 本机·8443 两个节点，直接用部署域名连接；如果只有它们能用、地区节点全超时，说明是数据源里的优选 IP 失效，不是 Worker 的问题。',
+  ].map((line) => `<p>${escapeHtml(line)}</p>`).join('\n        ');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex,nofollow">
+<title>免费节点订阅 · ${escapeHtml(hostName)}</title>
+<style>${PAGE_CSS}</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>免费节点订阅</h1>
+    <span class="ver">${PAGE_VERSION}</span>
+  </header>
+  <p class="host mono">${escapeHtml(hostName)}</p>
+  <div class="stat">
+    <span>数据 ${formatTime(fetchedAt)}</span><span>·</span>
+    <span>${total} 条记录 / ${unique} 个地址</span><span>·</span>
+    <span>${regions.length} 个地区 / ${nodes.length} 个节点</span><span>·</span>
+    <span>流量 ${formatTraffic(TRAFFIC_USED_BYTES)} / ${formatTraffic(TRAFFIC_TOTAL_BYTES)}</span><span>·</span>
+    <span>到期 ${formatShortTime(expireAt * 1000)}（24 小时）</span>${stale ? '<span>·</span><span>⚠️ 上游暂时不可用，正在使用上次的数据</span>' : ''}
+  </div>
+
+  <section>
+    <h2>订阅</h2>
+    <div class="rows">
+${subRow('Trojan（CFW / Verge 都支持）', 'Trojan · WS + TLS', sub.trojan)}
+${subRow('VMess（Clash for Windows）', 'VMess · WS + TLS', sub.vmess)}
+${subRow('VLESS（Clash Verge / Mihomo）', 'VLESS · WS + TLS', sub.vless)}
+    </div>
+    <p class="hint">「打开 Clash 导入」会直接唤起已经安装的 Clash 客户端；没有反应时先点「复制订阅链接」，再到客户端里粘贴订阅地址。</p>
+  </section>
+
+${regionSection}
+${((hostNodes && hostNodes.length) || (visaNodes && visaNodes.length)) ? `
+  <section>
+    <h2>0️⃣ visa优化</h2>
+    <div class="rows">
+${visaRows}
+    </div>
+    <p class="hint">沿用旧项目里的 13 个 visa 优选域名（0 号），其中 80/8080/8880/2052/2082/2086/2095 是非 TLS 端口；CF 会按 SNI 把流量送到本 Worker。</p>
+  </section>
+  <section>
+  <section>
+    <h2>🇨🇳 自动优化线路</h2>
+    <div class="rows">
+${hostRows}
+    </div>
+    <p class="hint">这一组直接用部署域名连接，不经过数据源里的优选 IP。优选 IP 整批失效时，先用它确认代理本身是否正常。</p>
+  </section>` : ''}
+
+  <section>
+    <h2>说明</h2>
+    <div class="note">
+        ${notes}
+    </div>
+    <p class="hint"><a href="${base}/selftest" target="_blank" rel="noopener">连接自检</a>（JSON）：检查这个 Worker 能否用 connect() 出网、NAT64 是否可用 —— 节点全都连不上时先看它。</p>
+    <details class="fold">
+      <summary>手动配置参数</summary>
+      <table class="kv">
+        <tr><th>地址</th><td>下面订阅里的优选 IP（也可用自定义域名）</td></tr>
+        <tr><th>端口</th><td class="mono">443 / 8443 / 2053 / 2083 / 2087 / 2096</td></tr>
+        <tr><th>UUID</th><td class="mono">${escapeHtml(userID)}</td></tr>
+        <tr><th>传输</th><td>ws / websocket</td></tr>
+        <tr><th>Host</th><td class="mono">${escapeHtml(hostName)}</td></tr>
+        <tr><th>路径</th><td class="mono">${escapeHtml(WS_PATH)}</td></tr>
+        <tr><th>TLS</th><td>开启，SNI = ${escapeHtml(hostName)}</td></tr>
+        <tr><th>数据源</th><td class="mono">${escapeHtml(sourceUrl || '-')}</td></tr>
+      </table>
+    </details>
+  </section>
+</main>
+<script>${PAGE_JS}</script>
+</body>
+</html>`;
+}
+
+async function handleSelftest(request) {
+  const hostName = request.headers.get('Host') || new URL(request.url).host;
+  const checks = {};
+
+  try {
+    const probe = new ReadableStream({ start() {} });
+    if (probe && typeof probe.cancel === 'function') probe.cancel().catch(() => {});
+    checks.streamConstructors = 'ok（本文件不依赖它，仅供参考）';
+  } catch (error) {
+    checks.streamConstructors = 'blocked: ' + ((error && error.message) || error);
+  }
+
+  // 真连一次并收发数据：connect() 返回只是「拿到 socket」，握手要等第一次写
+  async function probeTcp(hostname, port) {
+    const label = 'tcp ' + hostname + ':' + port;
+    const started = Date.now();
+    let socket = null;
+    try {
+      socket = await connectWithTimeout({ hostname, port }, 8000);
+      const writer = socket.writable.getWriter();
+      await writer.write(textEncoder.encode('GET / HTTP/1.1\r\nHost: ' + hostname + '\r\nConnection: close\r\n\r\n'));
+      writer.releaseLock();
+      const reader = socket.readable.getReader();
+      const race = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 6000)),
+      ]);
+      try { reader.releaseLock(); } catch (error) {}
+      if (race && race.timeout) {
+        checks[label] = 'fail: 读超时';
+      } else if (race && race.value) {
+        const head = new TextDecoder().decode(toBytes(race.value)).split('\r\n')[0];
+        checks[label] = 'ok ' + (Date.now() - started) + 'ms 「' + head.slice(0, 40) + '」';
+      } else {
+        checks[label] = 'fail: 连接被关闭（没有返回数据）';
+      }
+    } catch (error) {
+      checks[label] = 'fail: ' + ((error && error.message) || error);
+    } finally {
+      closeSocket(socket);
+    }
+  }
+
+  // 故意选非 Cloudflare 的目标：Worker 的 connect() 不允许连 Cloudflare 自己的 IP
+  await probeTcp('www.baidu.com', 80);
+  await probeTcp('www.qq.com', 80);
+
+  const failed = Object.values(checks).filter((value) => String(value).startsWith('fail')).length;
+  return new Response(JSON.stringify({
+    ok: failed === 0,
+    host: hostName,
+    uuid: userID,
+    wsPath: WS_PATH,
+    passwordPath: '/' + PASSWORD + '/',
+    nodeMode: '每次请求重新生成（无缓存）',
+    checks,
+  }, null, 2), {
+    status: 200,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
+async function handlePanel(request) {
+  const context = await buildContext(request);
+  return new Response(renderPanel(context), {
+    status: 200,
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store, max-age=0',
+      'x-node-count': String(context.nodes.length),
+    },
+  });
+}
