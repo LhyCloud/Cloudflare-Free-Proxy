@@ -8,7 +8,8 @@
  *   3. 生成两份 Clash 订阅：
  *        /<密码>/trojan  →  Trojan（CFW / Verge 老内核都支持）
  *        /<密码>/cv   →  Clash Verge / Mihomo（VLESS + WS + TLS）
- *   4. 同一个 Worker 同时是代理服务端，VLESS / Trojan 共用 UUID，路径 /?ed=2560。
+ *   4. 同一个 Worker 同时是代理服务端，VLESS / Trojan 共用 UUID，路径 /?ed=2560；
+ *      路径加 &via=1 的节点为「全流量中转」节点（所有目标都走代理池）。
  *   5. 订阅响应带 subscription-userinfo：已用 114 T / 总量 514 T，到期 = 当前时间 + 1 天
  *      （客户端里的「流量 / 剩余时间」就来自这里，每次请求都会重新计算）。
  *
@@ -82,13 +83,18 @@ const TROJAN_PASSWORD = 'cfnode-trojan-2026';
 // Worker 的 connect() 不允许直连 Cloudflare 自己的 IP（会报 Stream was cancelled），
 // 所以先连到 proxyip，再把客户端原始字节（TLS ClientHello，SNI=目标域名）原样转发，
 // 由它按 SNI 送进 CF 边缘 —— 这就是 deploy-guide 里 v4.4 用的那套办法。
-const PROXYIPS = [
-  'proxyip.fxxk.dedyn.io:443',
-  'proxyip.us.fxxk.dedyn.io:443',
-  'cdn.xn--b6gac.eu.org:443',
-  'cf.090227.xyz:443',
-  'proxyip.aliyun.fxxk.dedyn.io:443',
+// 候选 proxyip 的远端列表（第三方维护，可能失效；拉取失败就只用内置的）
+const PROXYIP_SOURCES = [
+  'https://raw.githubusercontent.com/cmliu/edgetunnel/main/ProxyIP.txt',
+  'https://cdn.jsdelivr.net/gh/cmliu/edgetunnel@main/ProxyIP.txt',
+  'https://raw.githubusercontent.com/cmliu/edgetunnel/main/ProxyIP.js',
 ];
+const PROXYIP_TTL = 10 * 60 * 1000;
+let proxyipCache = { list: [], at: 0 };
+
+// 这 5 个曾经可用的公共 proxyip 已全部失效（实测 ENOTFOUND / RST），留空；
+// 如果自己有 VPS 中转，按 'ip:port' 填进来，会优先于公共代理池使用。
+const PROXYIPS = [];
 
 // 订阅里保证至少有一个落在该延迟区间的节点（其余仍按评分挑）
 const TARGET_LATENCY_MIN = 100;
@@ -107,20 +113,30 @@ const HOST_PORTS_PLAIN = [80, 8080];
 
 // 0 号节点：沿用旧项目里的 visa 优选域名（域名:端口），标 0 号单独成组
 const INCLUDE_VISA_NODES = true;
+
+// 10 个「全流量中转」节点：路径带 ?via=1，Worker 会把该节点的所有连接都丢进代理池
+// （普通节点只在目标被 CF 拒时才用池）
+const RELAY_NODES = [
+  ['DOMAIN', 443], ['DOMAIN', 8443], ['DOMAIN', 2053], ['DOMAIN', 2083],
+  ['africa.visa.com', 443], ['qa.visamiddleeast.com', 443], ['www.visa.com.mt', 443],
+  ['www.visa.com.sg', 443], ['cis.visa.com', 8443], ['usa.visa.com', 443],
+];
+// 实测（入口往返，含 204）：按快慢排序；已删除
+//   www.visasoutheasturope.com:2096（域名已不存在）
+//   www.visa.com.sg:2052（2.8s，且与 :80 同主机）
+//   www.visa.com.tw:2053（3.6s，最慢）
+// 全部改到 TLS 端口（明文端口上部分客户端的延迟测试会误判失败），按实测速度排序
 const VISA_NODES = [
-  ['www.visa.com.sg', 80],
-  ['cis.visa.com', 8080],
-  ['africa.visa.com', 8880],
-  ['www.visa.com.sg', 2052],
-  ['www.visaeurope.at', 2082],
-  ['www.visa.com.mt', 2086],
-  ['qa.visamiddleeast.com', 2095],
+  ['africa.visa.com', 443],
+  ['qa.visamiddleeast.com', 443],
+  ['www.visaeurope.at', 8443],
+  ['www.visa.com.mt', 443],
+  ['www.visa.com.sg', 443],
+  ['cis.visa.com', 8443],
   ['usa.visa.com', 443],
   ['myanmar.visa.com', 8443],
-  ['www.visa.com.tw', 2053],
-  ['www.visaeurope.ch', 2083],
   ['www.visa.com.br', 2087],
-  ['www.visasoutheasturope.com', 2096],
+  ['www.visaeurope.ch', 2083],
 ];
 
 const PAGE_VERSION = 'V26.11.07';
@@ -208,6 +224,7 @@ export default {
       if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless');
       if (pathname === base + '/trojan') return await handleSubscription(request, 'trojan');
       if (pathname === base + '/selftest') return await handleSelftest(request);
+      if (pathname === base + '/lastcheck') return new Response(JSON.stringify(recentChecks, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
     } catch (error) {
       return new Response('节点数据生成失败：' + (error && error.message), {
         status: 503,
@@ -313,6 +330,16 @@ const textEncoder = new TextEncoder();
 
 // Clash / sing-box / v2rayN 的延迟检测都请求 generate_204，这里直接应答，
 // 探测结果即该节点的握手耗时；出口 80 端口不通时也不会被判定成 Timeout
+const recentChecks = [];
+
+function noteHealthCheck(bytes, extra = {}) {
+  try {
+    const text = new TextDecoder().decode(bytes.subarray(0, 160)).split('\r\n')[0];
+    recentChecks.push({ at: new Date().toISOString(), line: text, ...extra });
+    if (recentChecks.length > 12) recentChecks.shift();
+  } catch (error) {}
+}
+
 const HEALTH_CHECK_RESPONSE = textEncoder.encode('HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
 
 function isHealthCheckRequest(data) {
@@ -326,13 +353,13 @@ function isHealthCheckRequest(data) {
   return /^(GET|HEAD)\s+\S*generate_204\S*\s+HTTP\/1\.[01]/i.test(text);
 }
 
-function closeAfterSend(ws, code, reason) {
+function closeAfterSend(ws, code, reason, delay = 30) {
   setTimeout(() => {
     try {
       if (ws.readyState === WS_READY_STATE_OPEN) ws.close(code, reason);
     } catch (error) {
     }
-  }, 30);
+  }, delay);
 }
 
 const isIPv4 = (value) => /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
@@ -490,21 +517,268 @@ async function resolveIPv4(domain) {
 
 const cfHostCache = new Map();
 
-// 判断目标是否在 CF 段：IP 直接判断；域名查一次 DoH 并缓存（延迟检测走本地 204，不受影响）
+// 已知必然走 proxyip 的站点：省掉 DoH 探测和“先撞墙再重试”的那次往返
+const CF_HOSTED_HINTS = ['x.com', 'twitter.com', 'twimg.com', 't.co'];
+
+function hostedHint(address) {
+  const host = String(address || '').toLowerCase();
+  return CF_HOSTED_HINTS.some((hint) => host === hint || host.endsWith('.' + hint));
+}
+
+// IP 直接按网段判断；域名先看白名单/缓存，未命中就先直连，失败后再记进缓存
 async function needsProxyip(address) {
   if (isIPv4(address)) return ipInCloudflare(address);
-  if (cfHostCache.has(address)) return cfHostCache.get(address);
-  const list = await resolveIPv4(address);
-  const hosted = list.some((ip) => ipInCloudflare(ip));
-  if (cfHostCache.size > 500) cfHostCache.clear();
-  cfHostCache.set(address, hosted);
-  return hosted;
+  if (hostedHint(address)) return true;
+  return cfHostCache.get(address) === true;
 }
 
 function markCloudflareHost(address) {
   if (!address || isIPv4(address)) return;
   if (cfHostCache.size > 500) cfHostCache.clear();
   cfHostCache.set(address, true);
+}
+
+// 实时代理列表（monosans/proxy-list，社区每小时更新）。用 HTTP CONNECT 方式当中转：
+// 连上代理 → CONNECT 目标:443 → 之后原样转发 TLS 字节，相当于一个非 CF 的出口。
+const HTTP_PROXY_SOURCES = [
+  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
+  'https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/http.txt',
+];
+const PROXY_JSON_SOURCES = [
+  'https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies.json',
+  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies.json',
+];
+const SOCKS5_PROXY_SOURCES = [
+  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt',
+  'https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt',
+];
+const HTTP_PROXY_TTL = 30 * 60 * 1000;
+let httpProxyCache = { list: [], at: 0 };
+
+// 优先地区：离国内近的先排（按 proxies.json 里的 geolocation.country.iso_code）
+const PREFERRED_COUNTRIES = ['HK', 'TW', 'JP', 'KR', 'SG', 'MY', 'TH', 'VN', 'PH', 'ID', 'IN', 'US', 'DE', 'NL', 'GB'];
+
+async function fetchProxyList(sources) {
+  const seen = new Set();
+  for (const source of sources) {
+    try {
+      const text = await fetchText(source);
+      const lines = String(text).split(/\r?\n/).filter((line) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(line.trim()));
+      for (const line of lines.slice(0, 400)) seen.add(line.trim());
+      if (seen.size >= 40) break;
+    } catch (error) {}
+  }
+  return [...seen].slice(0, 400);
+}
+
+// proxies.json 里带地区/城市/ASN/timeout，可按地区筛选；文件约 1MB，只解析一次并缓存
+async function fetchGeoProxies() {
+  for (const source of PROXY_JSON_SOURCES) {
+    try {
+      const text = await fetchText(source);
+      if (!text || text.length < 1000) continue;
+      const list = JSON.parse(text);
+      if (!Array.isArray(list) || !list.length) continue;
+      const byCountry = new Map();
+      for (const item of list) {
+        if (!item || !item.host || !item.port) continue;
+        const protocol = String(item.protocol || '').toLowerCase();
+        if (protocol !== 'http' && protocol !== 'socks5') continue;
+        const iso = item.geolocation && item.geolocation.country && item.geolocation.country.iso_code;
+        const rank = PREFERRED_COUNTRIES.indexOf(String(iso || '').toUpperCase());
+        if (rank < 0) continue;
+        const key = item.host + ':' + item.port;
+        const score = rank * 10 + (Number(item.timeout) || 1);
+        if (!byCountry.has(protocol)) byCountry.set(protocol, new Map());
+        const bucket = byCountry.get(protocol);
+        const previous = bucket.get(key);
+        if (!previous || score < previous.score) bucket.set(key, { key, score });
+      }
+      const result = { http: [], socks5: [] };
+      for (const [protocol, bucket] of byCountry) {
+        result[protocol] = [...bucket.values()].sort((a, b) => a.score - b.score).slice(0, 60).map((item) => item.key);
+      }
+      if (result.http.length || result.socks5.length) return result;
+    } catch (error) {}
+  }
+  return null;
+}
+
+async function loadHttpProxies() {
+  if ((httpProxyCache.list.length || (httpProxyCache.socks || []).length) && Date.now() - httpProxyCache.at < HTTP_PROXY_TTL) {
+    return httpProxyCache.list;
+  }
+  // 注：proxies.json 带地区/城市，但约 1MB，Worker 里解析+传输会超时（实测请求直接 504/EOF），
+  // 所以运行时仍用轻量的 txt 列表（http 18KB / socks5 3KB）。
+  const http = await fetchProxyList(HTTP_PROXY_SOURCES);
+  const socks = await fetchProxyList(SOCKS5_PROXY_SOURCES);
+  httpProxyCache = { list: http, socks, at: Date.now(), geo: false };
+  return http;
+}
+
+function pickProxies(list, count) {
+  if (!list.length) return [];
+  const picks = [];
+  const used = new Set();
+  const limit = Math.min(count, list.length);
+  while (picks.length < limit) {
+    const index = Math.floor(Math.random() * list.length);
+    if (used.has(index)) {
+      if (used.size >= list.length) break;
+      continue;
+    }
+    used.add(index);
+    picks.push(list[index]);
+  }
+  return picks;
+}
+
+// SOCKS5：无认证握手 → CONNECT 域名 → 之后透传 TLS 字节
+async function connectViaSocks5Proxy(proxy, targetHost, targetPort, payload, timeout = 3500) {
+  const index = proxy.lastIndexOf(':');
+  const host = proxy.slice(0, index);
+  const port = Number(proxy.slice(index + 1));
+  if (!host || !Number.isInteger(port)) throw new Error('代理地址无效');
+
+  const socket = await connectWithTimeout({ hostname: host, port }, timeout);
+  const reader = socket.readable.getReader();
+  const readExact = async (size) => {
+    const parts = [];
+    let filled = 0;
+    while (filled < size) {
+      const raced = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), timeout)),
+      ]);
+      if (raced.timeout) throw new Error('socks5 响应超时');
+      if (raced.done) throw new Error('socks5 连接关闭');
+      const chunk = toBytes(raced.value);
+      parts.push(chunk);
+      filled += chunk.length;
+    }
+    return concatBytes(...parts);
+  };
+
+  try {
+    const writer = socket.writable.getWriter();
+    await writer.write(new Uint8Array([0x05, 0x01, 0x00]));  // 只支持无认证
+    writer.releaseLock();
+    const method = await readExact(2);
+    if (method[0] !== 0x05 || method[1] !== 0x00) throw new Error('socks5 需要认证');
+
+    const hostBytes = textEncoder.encode(targetHost);
+    const request = new Uint8Array(4 + 1 + hostBytes.length + 2);
+    request[0] = 0x05; request[1] = 0x01; request[2] = 0x00; request[3] = 0x03;
+    request[4] = hostBytes.length;
+    request.set(hostBytes, 5);
+    request[5 + hostBytes.length] = (targetPort >> 8) & 0xff;
+    request[6 + hostBytes.length] = targetPort & 0xff;
+    const out = socket.writable.getWriter();
+    await out.write(request);
+    out.releaseLock();
+
+    const head = await readExact(4);
+    if (head[1] !== 0x00) throw new Error('socks5 CONNECT 被拒');
+    let skip = 0;
+    if (head[3] === 0x01) skip = 4 + 2;
+    else if (head[3] === 0x04) skip = 16 + 2;
+    else if (head[3] === 0x03) { const len = await readExact(1); skip = len[0] + 2; }
+    if (skip) await readExact(skip);
+    try { reader.releaseLock(); } catch (error) {}
+
+    if (payload.length) {
+      const w = socket.writable.getWriter();
+      await w.write(payload);
+      w.releaseLock();
+    }
+    return socket;
+  } catch (error) {
+    try { reader.releaseLock(); } catch (e) {}
+    closeSocket(socket);
+    throw error;
+  }
+}
+
+// 并发竞争：谁先 CONNECT 成功就用谁；成功的那个记住，下次先试
+async function raceProxies(targetHost, targetPort, payload, count = 8) {
+  const list = await loadHttpProxies();
+  if (!list.length) throw new Error('代理列表为空');
+
+  if (httpProxyCache.good) {
+    try {
+      return await connectViaHttpProxy(httpProxyCache.good, targetHost, targetPort, payload, 2500);
+    } catch (error) {
+      httpProxyCache.good = null;
+    }
+  }
+
+  const socks = httpProxyCache.socks || [];
+  const httpPicks = pickProxies(list, Math.ceil(count / 2));
+  const socksPicks = pickProxies(socks, Math.floor(count / 2));
+  const attempts = httpPicks.map((proxy) => connectViaHttpProxy(proxy, targetHost, targetPort, payload, 3000)
+    .then((socket) => ({ socket, proxy })))
+    .concat(socksPicks.map((proxy) => connectViaSocks5Proxy(proxy, targetHost, targetPort, payload, 3000)
+      .then((socket) => ({ socket, proxy }))));
+  const winner = await Promise.any(attempts);
+  httpProxyCache.good = winner.proxy;
+  attempts.forEach((pending) => pending.then((item) => {
+    if (item.proxy !== winner.proxy) closeSocket(item.socket);
+  }).catch(() => {}));
+  return winner.socket;
+}
+
+// 通过 HTTP 代理建一条到 target 的隧道，并把首包写进去
+async function connectViaHttpProxy(proxy, targetHost, targetPort, payload, timeout = 3500) {
+  const index = proxy.lastIndexOf(':');
+  const host = proxy.slice(0, index);
+  const port = Number(proxy.slice(index + 1));
+  if (!host || !Number.isInteger(port)) throw new Error('代理地址无效');
+
+  const socket = await connectWithTimeout({ hostname: host, port }, timeout);
+  try {
+    const writer = socket.writable.getWriter();
+    await writer.write(textEncoder.encode('CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n\r\n'));
+    writer.releaseLock();
+
+    const reader = socket.readable.getReader();
+    let buffer = new Uint8Array(0);
+    let headerEnd = -1;
+    while (headerEnd < 0) {
+      const raced = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), timeout)),
+      ]);
+      if (raced.timeout) throw new Error('代理响应超时');
+      const { value, done } = raced;
+      if (done) throw new Error('代理提前关闭');
+      buffer = concatBytes(buffer, toBytes(value));
+      headerEnd = findHeaderEnd(buffer);
+      if (buffer.length > 4096) throw new Error('代理响应过长');
+    }
+    try { reader.releaseLock(); } catch (error) {}
+
+    const head = new TextDecoder().decode(buffer.subarray(0, headerEnd));
+    if (!/^HTTP\/1\.[01] 200/.test(head)) throw new Error('代理拒绝 CONNECT');
+
+    const rest = buffer.subarray(headerEnd + 4);
+    const data = rest.length ? concatBytes(rest, payload) : payload;
+    if (data.length) {
+      const out = socket.writable.getWriter();
+      await out.write(data);
+      out.releaseLock();
+    }
+    return socket;
+  } catch (error) {
+    closeSocket(socket);
+    throw error;
+  }
+}
+
+function findHeaderEnd(bytes) {
+  for (let i = 0; i + 3 < bytes.length; i += 1) {
+    if (bytes[i] === 0x0d && bytes[i + 1] === 0x0a && bytes[i + 2] === 0x0d && bytes[i + 3] === 0x0a) return i;
+  }
+  return -1;
 }
 
 function parseProxyip(value) {
@@ -523,30 +797,159 @@ async function writeSocket(socket, payload) {
 }
 
 // 依次尝试：直连 → NAT64 → 各个 proxyip。首包要一起写，连 CF 的 IP 时错误在 write 阶段才暴露
-async function openTarget(address, port, payload) {
-  const attempts = [{ label: 'direct', options: { hostname: address, port } }];
-  if (isIPv4(address)) attempts.push({ label: 'nat64', options: { hostname: toNat64(address), port } });
-  for (const proxyip of PROXYIPS) {
-    const parsed = parseProxyip(proxyip);
-    if (parsed) attempts.push({ label: 'proxyip ' + proxyip, options: parsed });
-  }
+/* ------------------------------------------------------------------
+ * proxyip 池：粘性 + 并发探活 + 失败计数（学 deploy-guide v4.4 的做法）
+ * ------------------------------------------------------------------ */
 
-  // 目标在 CF 段里（x.com / twitter.com 这类）就先走 proxyip，别去撞 connect() 的限制
-  if (await needsProxyip(address)) {
-    attempts.sort((a, b) => (b.label.startsWith('proxyip') ? 1 : 0) - (a.label.startsWith('proxyip') ? 1 : 0));
+const proxyPool = { current: null, fails: 0 };
+const PROXYIP_FAIL_MAX = 2;
+const PROXYIP_TRY_TIMEOUT = 3000;
+
+// 数据源快照里的 IP 也可能是「能当反代用」的地址，拿来当候选（零成本，失败一瞬间）
+function snapshotProxyCandidates(limit = 6) {
+  const entries = (lastSnapshot && lastSnapshot.entries) || [];
+  const out = [];
+  for (const entry of entries) {
+    if (out.length >= limit) break;
+    if (!isIPv4(entry.ip)) continue;
+    const candidate = entry.ip + ':443';
+    if (!out.includes(candidate)) out.push(candidate);
+  }
+  return out;
+}
+
+async function loadProxyipList() {
+  if (proxyipCache.list.length && Date.now() - proxyipCache.at < PROXYIP_TTL) return proxyipCache.list;
+  const merged = new Set(PROXYIPS);
+  for (const source of PROXYIP_SOURCES) {
+    try {
+      const text = await fetchText(source);
+      let added = 0;
+      for (const line of String(text).split(/\r?\n/)) {
+        const value = line.trim();
+        if (!value || value.startsWith('#') || value.startsWith('//') || value.startsWith('<')) continue;
+        if (parseProxyip(value)) { if (!merged.has(value)) { merged.add(value); added += 1; } }
+        else if (/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value)) { const item = value + ':443'; if (!merged.has(item)) { merged.add(item); added += 1; } }
+      }
+      if (added >= 3) break;
+    } catch (error) {}
+  }
+  proxyipCache = { list: [...merged].slice(0, 24), at: Date.now() };
+  return proxyipCache.list;
+}
+
+async function tryProxyip(value, payload) {
+  const parsed = parseProxyip(value);
+  if (!parsed) throw new Error('候选无效');
+  const socket = await connectWithTimeout(parsed, PROXYIP_TRY_TIMEOUT);
+  try {
+    await writeSocket(socket, payload);
+  } catch (error) {
+    closeSocket(socket);
+    throw error;
+  }
+  return socket;
+}
+
+async function connectViaPool(payload) {
+  // 粘性候选先试；失败再按列表顺序逐个试（3 秒超时，原来 10 秒太拖）
+  const ordered = [];
+  if (proxyPool.current) ordered.push(proxyPool.current);
+  for (const value of PROXYIPS) {
+    if (!ordered.includes(value)) ordered.push(value);
   }
 
   let lastError = null;
-  for (const attempt of attempts) {
-    let socket = null;
+  for (const value of ordered) {
     try {
-      socket = await connectWithTimeout(attempt.options, 10000);
-      await writeSocket(socket, payload);
+      const socket = await tryProxyip(value, payload);
+      proxyPool.current = value;
+      proxyPool.fails = 0;
       return socket;
     } catch (error) {
       lastError = error;
+      if (value === proxyPool.current) {
+        proxyPool.fails += 1;
+        if (proxyPool.fails >= PROXYIP_FAIL_MAX) {
+          proxyPool.current = null;
+          proxyPool.fails = 0;
+        }
+      }
+    }
+  }
+  throw lastError || new Error('proxyip 全部不可用');
+}
+
+// 数据面回到最朴素的顺序：直连 → NAT64（仅 IPv4）→ 内置的固定中转。
+// 这里不再拉任何远端列表，也不做动态探测，避免每条新连接都要等一次网络请求。
+async function connectAttempts(list, payload) {
+  for (const attempt of list) {
+    let socket = null;
+    try {
+      socket = await connectWithTimeout(attempt.options, attempt.timeout);
+      await writeSocket(socket, payload);
+      return socket;
+    } catch (error) {
       closeSocket(socket);
     }
+  }
+  return null;
+}
+
+async function openTarget(address, port, payload, forceRelay = false) {
+  // 中转节点：不管目标是哪，全部走代理池
+  if (forceRelay) {
+    try {
+      return await raceProxies(address, port, payload, 8);
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  // CF 托管站点（x.com 这类）：直连必失败，别浪费 20 秒在死中转上，直接并发抢代理
+  if (await needsProxyip(address)) {
+    let poolError = null;
+    try {
+      return await raceProxies(address, port, payload, 8);
+    } catch (error) {
+      poolError = error;
+    }
+    for (const proxyip of PROXYIPS) {
+      const parsed = parseProxyip(proxyip);
+      if (!parsed) continue;
+      let socket = null;
+      try {
+        socket = await connectWithTimeout(parsed, 1500);
+        await writeSocket(socket, payload);
+        return socket;
+      } catch (error) {
+        closeSocket(socket);
+      }
+    }
+    throw poolError || new Error('无法连接目标');
+  }
+
+  // ① 直连（普通站点正常都走这里，最省钱最快）
+  let lastError = null;
+  const direct = await connectAttempts([{ options: { hostname: address, port }, timeout: 8000 }], payload);
+  if (direct) return direct;
+  // ② IPv4 再补一次 NAT64
+  if (isIPv4(address)) {
+    const nat64 = await connectAttempts([{ options: { hostname: toNat64(address), port }, timeout: 6000 }], payload);
+    if (nat64) return nat64;
+  }
+  // ③ 直连被拒（多半是 CF 托管站点）：先进实时代理池并发抢
+  try {
+    return await raceProxies(address, port, payload, 8);
+  } catch (error) {
+    lastError = error;
+  }
+  // ④ 最后才是固定中转（每个 1.2 秒，不合用就快速跳过）
+  for (const proxyip of PROXYIPS) {
+    const parsed = parseProxyip(proxyip);
+    if (!parsed) continue;
+    const socket = await connectAttempts([{ options: parsed, timeout: 1200 }], payload);
+    if (socket) return socket;
   }
   throw lastError || new Error('无法连接目标');
 }
@@ -583,6 +986,10 @@ async function readSocketData(data) {
 }
 
 async function handleProxyWebSocket(request) {
+  let forceRelay = false;
+  try {
+    forceRelay = new URL(request.url).searchParams.get('via') === '1';
+  } catch (error) {}
   const wsPair = new WebSocketPair();
   const [clientWS, serverWS] = Object.values(wsPair);
 
@@ -624,7 +1031,7 @@ async function handleProxyWebSocket(request) {
       try { serverWS.close(1002, '未知协议'); } catch (error) {}
       return;
     }
-    session = protocol === 'trojan' ? createTrojanSession(serverWS) : createVlessSession(serverWS);
+    session = protocol === 'trojan' ? createTrojanSession(serverWS, forceRelay) : createVlessSession(serverWS, forceRelay);
     return session.feed(buffered);
   };
 
@@ -656,7 +1063,7 @@ async function handleProxyWebSocket(request) {
   });
 }
 
-function createVlessSession(serverWS) {
+function createVlessSession(serverWS, forceRelay = false) {
   let remoteSocket = null;
   let vlessResponseHeader = null;
   let firstUserData = true;
@@ -681,7 +1088,7 @@ function createVlessSession(serverWS) {
       remoteSocket = null;
       markCloudflareHost(targetAddress);
       try {
-        const socket = await openTarget(targetAddress, targetPort, bytes);
+        const socket = await openTarget(targetAddress, targetPort, bytes, forceRelay);
         remoteSocket = socket;
         const epoch = ++pipeEpoch;
         pipeRemoteToWebSocket(socket, serverWS, vlessResponseHeader, retry, () => epoch === pipeEpoch);
@@ -704,15 +1111,15 @@ function createVlessSession(serverWS) {
     if (awaitingFirstData) {
       awaitingFirstData = false;
       // Clash 的延迟检测就地应答，别去连上游，否则测出来的延迟虚高
-      if (isHealthCheckRequest(chunk)) {
+      if (isHealthCheckRequest(chunk)) { noteHealthCheck(chunk);
         if (serverWS.readyState === WS_READY_STATE_OPEN) {
           serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
-          closeAfterSend(serverWS, 1000, '延迟检测');
+          closeAfterSend(serverWS, 1000, '延迟检测', 30);
         }
         return;
       }
       try {
-        const socket = await openTarget(targetAddress, targetPort, chunk);
+        const socket = await openTarget(targetAddress, targetPort, chunk, forceRelay);
         remoteSocket = socket;
         const epoch = ++pipeEpoch;
         pipeRemoteToWebSocket(socket, serverWS, vlessResponseHeader, null, () => epoch === pipeEpoch);
@@ -726,12 +1133,12 @@ function createVlessSession(serverWS) {
     if (remoteSocket) {
       if (firstUserData) {
         firstUserData = false;
-        if (isHealthCheckRequest(chunk)) {
+        if (isHealthCheckRequest(chunk)) { noteHealthCheck(chunk);
           closeSocket(remoteSocket);
           remoteSocket = null;
           if (serverWS.readyState === WS_READY_STATE_OPEN) {
             serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
-            closeAfterSend(serverWS, 1000, '延迟检测');
+            closeAfterSend(serverWS, 1000, '延迟检测', 30);
           }
           return;
         }
@@ -750,7 +1157,7 @@ function createVlessSession(serverWS) {
     targetAddress = result.addressRemote;
     targetPort = result.portRemote;
 
-    if (!result.isUDP && isHealthCheckRequest(rawClientData)) {
+    if (!result.isUDP && isHealthCheckRequest(rawClientData)) { noteHealthCheck(rawClientData);
       serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
       closeAfterSend(serverWS, 1000, '延迟检测');
       return;
@@ -770,7 +1177,7 @@ function createVlessSession(serverWS) {
 
     async function connectAndWrite(address, port) {
       // 直连 → NAT64 → proxyip（x.com / twitter.com 这类 CF 托管站点只能走 proxyip）
-      const tcpSocket = await openTarget(address, port, rawClientData);
+      const tcpSocket = await openTarget(address, port, rawClientData, forceRelay);
       remoteSocket = tcpSocket;
       return tcpSocket;
     }
@@ -882,7 +1289,7 @@ async function pipeRemoteRaw(remoteSocket, ws) {
   }
 }
 
-function createTrojanSession(serverWS) {
+function createTrojanSession(serverWS, forceRelay = false) {
   let remote = null;
   let buffered = new Uint8Array(0);
   let shut = false;
@@ -909,15 +1316,15 @@ function createTrojanSession(serverWS) {
     if (awaiting) {
       const target = awaiting;
       awaiting = null;
-      if (isHealthCheckRequest(chunk)) {
+      if (isHealthCheckRequest(chunk)) { noteHealthCheck(chunk);
         if (serverWS.readyState === WS_READY_STATE_OPEN) {
           serverWS.send(HEALTH_CHECK_RESPONSE);
-          closeAfterSend(serverWS, 1000, '延迟检测');
+          closeAfterSend(serverWS, 1000, '延迟检测', 30);
         }
         return;
       }
       try {
-        remote = await openTarget(target.address, target.port, chunk);
+        remote = await openTarget(target.address, target.port, chunk, forceRelay);
       } catch (error) {
         shutdown('连接失败');
         return;
@@ -967,15 +1374,15 @@ function createTrojanSession(serverWS) {
       awaiting = { address, port };
       return;
     }
-    if (isHealthCheckRequest(payload)) {
+    if (isHealthCheckRequest(payload)) { noteHealthCheck(payload);
       if (serverWS.readyState === WS_READY_STATE_OPEN) {
         serverWS.send(HEALTH_CHECK_RESPONSE);
-        closeAfterSend(serverWS, 1000, '延迟检测');
+        closeAfterSend(serverWS, 1000, '延迟检测', 30);
       }
       return;
     }
     try {
-      remote = await openTarget(address, port, payload);
+      remote = await openTarget(address, port, payload, forceRelay);
     } catch (error) {
       shutdown('连接失败');
       return;
@@ -1524,15 +1931,15 @@ function buildHostNodes(hostName) {
   if (!INCLUDE_HOST_NODES) return [];
   const ports = HOST_PORTS.map((port) => ({ port, tls: true }))
     .concat(HOST_PORTS_PLAIN.map((port) => ({ port, tls: false })));
-  return ports.map(({ port, tls }) => ({
-    name: '🇨🇳 自动优化线路·' + port,
+  return ports.map(({ port, tls }, index) => ({
+    name: '🇨🇳 本机优化 ' + (index + 1),
     server: hostName,
     port,
     uuid: userID,
     host: hostName,
     path: WS_PATH,
     tls,
-    region: '自动优化线路',
+    region: '本机优化',
     flag: '🇨🇳',
     country: 'CN',
     city: '',
@@ -1547,7 +1954,7 @@ function buildHostNodes(hostName) {
 function buildVisaNodes(hostName) {
   if (!INCLUDE_VISA_NODES) return [];
   return VISA_NODES.map(([server, port], index) => ({
-    name: '0️⃣ visa优化·' + (index + 1),
+    name: '0️⃣ visa优化 ' + (index + 1),
     server,
     port,
     uuid: userID,
@@ -1563,6 +1970,31 @@ function buildVisaNodes(hostName) {
     score: 0,
     visaNode: true,
   }));
+}
+
+// 中转节点：入口与普通节点一样，只是路径多了 ?via=1
+function buildRelayNodes(hostName) {
+  return RELAY_NODES.map(([server, port], index) => {
+    const target = server === 'DOMAIN' ? hostName : server;
+    const short = server === 'DOMAIN' ? '本机' : server.replace(/\./g, '-');
+    return {
+      name: '🔀 中转代理 ' + (index + 1),
+      server: target,
+      port,
+      uuid: userID,
+      host: hostName,
+      path: WS_PATH + '&via=1',
+      tls: true,
+      region: '中转',
+      flag: '🔁',
+      country: 'RELAY',
+      city: '',
+      speed: 0,
+      latency: 0,
+      score: 0,
+      relayNode: true,
+    };
+  });
 }
 
 async function buildContext(request) {
@@ -1585,6 +2017,7 @@ async function buildContext(request) {
   const selected = selectNodes(snapshot.entries, hostName);
   const hostNodes = buildHostNodes(hostName);
   const visaNodes = buildVisaNodes(hostName);
+  const relayNodes = buildRelayNodes(hostName);
   if (!selected.nodes.length && !hostNodes.length) {
     throw new Error(snapshot.error || '没有可用节点');
   }
@@ -1593,9 +2026,10 @@ async function buildContext(request) {
     hostName,
     // 本机入口放最前面：优选 IP 常常整批失效，客户端默认就能先连上可用的
     // 0 号 visa → 自动优化线路 → 各地区（同国家相邻，保持评分顺序）
-    nodes: visaNodes.concat(hostNodes).concat(selected.nodes),
+    nodes: visaNodes.concat(hostNodes).concat(relayNodes).concat(selected.nodes),
     hostNodes,
     visaNodes,
+    relayNodes,
     regions: selected.regions,
     unique: new Set(snapshot.entries.map((entry) => entry.ip + '|' + entry.port)).size,
     sourceUrl: snapshot.sourceUrl,
@@ -1644,7 +2078,6 @@ bind-address: '*'
 mode: rule
 log-level: info
 ipv6: false
-unified-delay: true
 tcp-concurrent: true
 find-process-mode: strict
 global-client-fingerprint: chrome
@@ -1661,6 +2094,7 @@ dns:
     - '*.lan'
     - '*.local'
     - localhost.ptlogin2.qq.com
+    - '__HOST__'
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -1707,7 +2141,7 @@ function isDomainNode(node) {
 
 function yamlGroups(nodes) {
   const all = nodes.map((node) => '    - ' + quoteYaml(node.name));
-  const domainNodes = nodes.filter((node) => isDomainNode(node));
+  const domainNodes = nodes.filter((node) => node.visaNode || node.hostNode);
   const ipNodes = nodes.filter((node) => !isDomainNode(node));
   const groups = [];
 
@@ -1715,11 +2149,10 @@ function yamlGroups(nodes) {
     '- name: 🚀 节点选择',
     '  type: select',
     '  proxies:',
-    '    - ⚡ 低延迟',
     '    - ♻️ 自动选择',
     '    - 🔁 自动优化',
     '    - ⚖️ 负载均衡',
-    '    - 0️⃣ visa优化',
+    '    - 🔁 自动中转',
     '    - DIRECT',
     ...all,
   ].join('\n'));
@@ -1737,26 +2170,13 @@ function yamlGroups(nodes) {
     ].join('\n'));
   }
 
-  const fastNodes = ipNodes.filter((node) => node.latency <= 150);
-  if (fastNodes.length) {
-    groups.push([
-      '- name: ⚡ 低延迟',
-      '  type: url-test',
-      '  url: http://www.gstatic.com/generate_204',
-      '  interval: 120',
-      '  tolerance: 30',
-      '  proxies:',
-      ...fastNodes.map((node) => '    - ' + quoteYaml(node.name)),
-    ].join('\n'));
-  }
-
   // 全部域名节点集中在这个组里自动测速选优
   if (domainNodes.length) {
     groups.push([
       '- name: 🔁 自动优化',
       '  type: url-test',
       '  url: http://www.gstatic.com/generate_204',
-      '  interval: 120',
+      '  interval: 300',
       '  tolerance: 30',
       '  proxies:',
       ...domainNodes.map((node) => '    - ' + quoteYaml(node.name)),
@@ -1773,13 +2193,16 @@ function yamlGroups(nodes) {
     ...all,
   ].join('\n'));
 
-  const visaGroupNodes = nodes.filter((node) => node.visaNode);
-  if (visaGroupNodes.length) {
+  const relayGroupNodes = nodes.filter((node) => node.relayNode);
+  if (relayGroupNodes.length) {
     groups.push([
-      '- name: 0️⃣ visa优化',
-      '  type: select',
+      '- name: 🔁 自动中转',
+      '  type: url-test',
+      '  url: http://www.gstatic.com/generate_204',
+      '  interval: 300',
+      '  tolerance: 50',
       '  proxies:',
-      ...visaGroupNodes.map((node) => '    - ' + quoteYaml(node.name)),
+      ...relayGroupNodes.map((node) => '    - ' + quoteYaml(node.name)),
     ].join('\n'));
   }
 
@@ -1801,12 +2224,17 @@ function formatTraffic(bytes) {
   return (Number.isInteger(value) ? String(value) : value.toFixed(1)) + ' T';
 }
 
+function withUnifiedDelay(yaml, enabled) {
+  if (!enabled) return yaml;
+  return yaml.replace('log-level: info\n', 'log-level: info\nunified-delay: true\n');
+}
+
 function yamlDocument(context, kind, meta = false) {
   const { nodes, regions, sourceUrl, fetchedAt, stale } = context;
   const head = [
     '# Cloudflare Pages 自动生成 · ' + formatTime(fetchedAt),
     '# 数据源 ' + (sourceUrl || '-') + (stale ? '（上游暂时不可用，已使用上次成功的数据）' : (context.sourceError ? '（上游暂时不可用）' : '')),
-    '# 节点 ' + nodes.length + ' 个（0️⃣ visa ' + context.visaNodes.length + ' 个 + 🇨🇳 自动优化线路 ' + context.hostNodes.length + ' 个）· 地区 ' + regions.length + ' 个 · 每地区最多 ' + PER_REGION + ' 个',
+    '# 节点 ' + nodes.length + ' 个（0️⃣ visa ' + context.visaNodes.length + ' 个 + 🇨🇳 本机优化 ' + context.hostNodes.length + ' 个 + 中转代理 ' + context.relayNodes.length + ' 个）· 地区 ' + regions.length + ' 个 · 每地区最多 ' + PER_REGION + ' 个',
     '# 排序依据：带宽 + 延迟综合评分，同地区只保留评分最高的几个',
     '# 订阅流量 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / ' + formatTraffic(TRAFFIC_TOTAL_BYTES) +
       ' · 到期 ' + formatTime(context.expireAt * 1000),
@@ -1824,8 +2252,21 @@ function yamlDocument(context, kind, meta = false) {
     '  - MATCH,🚀 节点选择',
   ];
 
+  // fake-ip 会把「节点自己的域名」也解析成 198.18.x，导致域名型节点永远连不上；
+  // 这里把所有域名型节点（visa、自动优化线路等）统统加进白名单
+  const domainServers = Array.from(new Set(
+    nodes.map((node) => String(node.server)).filter((server) => /[a-z]/i.test(server)),
+  ));
+  const fakeIpFilter = [context.hostName]
+    .concat(domainServers.filter((server) => server !== context.hostName))
+    .map((item) => "    - '" + item + "'")
+    .join('\n');
+  const baseText = withUnifiedDelay(meta || kind === 'vless' ? CV_BASE : CFW_BASE, context.unifiedDelay)
+    .replace(/^ {4}- '__HOST__'$/m, fakeIpFilter)
+    .replace(/__HOST__/g, context.hostName);
+
   return head.concat([
-    (meta || kind === 'vless' ? CV_BASE : CFW_BASE).replace(/__HOST__/g, context.hostName),
+    baseText,
     '',
     'proxies:',
     nodes.map((node) => yamlProxy(node, kind)).join('\n\n'),
@@ -1840,6 +2281,7 @@ async function handleSubscription(request, kind) {
   const url = new URL(request.url);
   const ua = request.headers.get('user-agent') || '';
   // Meta 内核支持 unified-delay（延迟显示会扣掉握手），老内核不支持
+  context.unifiedDelay = url.searchParams.get('unified') !== '0';
   const meta = url.searchParams.has('meta')
     ? url.searchParams.get('meta') !== '0'
     : /mihomo|clash[-_ ]?verge|clash[-_. ]?meta|clashx|stash|flclash|meta/i.test(ua);
@@ -1849,7 +2291,8 @@ async function handleSubscription(request, kind) {
     headers: {
       'content-type': 'text/yaml; charset=utf-8',
       'cache-control': 'no-store, max-age=0',
-      'content-disposition': 'inline; filename="' + kind + '.yaml"',
+      // 客户端里显示的配置名：Trojan-cfn114.sdfwq.cc.cd
+      'content-disposition': 'attachment; filename="' + (kind === 'trojan' ? 'Trojan' : 'VLESS') + '-' + context.hostName + '.yaml"',
       // 告诉客户端多久自动更新一次订阅（mihomo / Clash Verge 支持，单位小时）
       'profile-update-interval': String(UPDATE_INTERVAL_HOURS),
       'profile-web-page-url': 'https://' + context.hostName + '/' + PASSWORD + '/',
@@ -2020,17 +2463,6 @@ ${nodeRows}
     <h2>地区</h2>
     <p class="hint">数据源暂时不可用${sourceError ? '（' + escapeHtml(sourceError) + '）' : ''}，本次只有本机入口节点可用。</p>
   </section>`;
-  const visaRows = (visaNodes || []).map((node) => `        <div class="row">
-          <div class="meta"><span class="flag">0️⃣</span><span class="name">${escapeHtml(node.name)}</span><span class="tag">${node.port}${node.tls ? ' · TLS' : ''}</span></div>
-          <span class="tag">visa 优选域名</span>
-          <div class="val mono">${escapeHtml(node.server)}:${node.port}</div>
-        </div>`).join('\n');
-
-  const hostRows = (hostNodes || []).map((node) => `        <div class="row">
-          <div class="meta"><span class="flag">🏠</span><span class="name">${escapeHtml(node.name)}</span><span class="tag">${node.port}</span></div>
-          <span class="tag">直连部署域名</span>
-          <div class="val mono">${escapeHtml(node.server)}:${node.port}</div>
-        </div>`).join('\n');
 
   const notes = [
     '每次打开或刷新页面、每次客户端更新订阅，都会重新抓取数据源并重新挑选节点，不做任何缓存（上游失败时才会退回上一次成功的数据）。',
@@ -2080,22 +2512,6 @@ ${subRow('VLESS（Clash Verge / Mihomo）', 'VLESS · WS + TLS', sub.vless)}
   </section>
 
 ${regionSection}
-${((hostNodes && hostNodes.length) || (visaNodes && visaNodes.length)) ? `
-  <section>
-    <h2>0️⃣ visa优化</h2>
-    <div class="rows">
-${visaRows}
-    </div>
-    <p class="hint">沿用旧项目里的 13 个 visa 优选域名（0 号），其中 80/8080/8880/2052/2082/2086/2095 是非 TLS 端口；CF 会按 SNI 把流量送到本 Worker。</p>
-  </section>
-  <section>
-  <section>
-    <h2>🇨🇳 自动优化线路</h2>
-    <div class="rows">
-${hostRows}
-    </div>
-    <p class="hint">这一组直接用部署域名连接，不经过数据源里的优选 IP。优选 IP 整批失效时，先用它确认代理本身是否正常。</p>
-  </section>` : ''}
 
   <section>
     <h2>说明</h2>
@@ -2167,6 +2583,12 @@ async function handleSelftest(request) {
   }
 
   // 故意选非 Cloudflare 的目标：Worker 的 connect() 不允许连 Cloudflare 自己的 IP
+  const httpCount = httpProxyCache.list.length;
+  const socksCount = (httpProxyCache.socks || []).length;
+  checks.proxyList = (httpCount || socksCount)
+    ? 'ok http ' + httpCount + ' / socks5 ' + socksCount + '（' + (httpProxyCache.geo ? '带地区，按就近排序' : '纯列表') + '，已缓存）'
+    : '（尚未加载，首次访问需走代理的站点时才拉取）';
+
   await probeTcp('www.baidu.com', 80);
   await probeTcp('www.qq.com', 80);
 
