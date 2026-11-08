@@ -529,9 +529,18 @@ function hostedHint(address) {
 async function needsProxyip(address) {
   if (isIPv4(address)) return ipInCloudflare(address);
   if (hostedHint(address)) return true;
-  return cfHostCache.get(address) === true;
+  if (cfHostCache.has(address)) return cfHostCache.get(address) === true;
+  // 未命中白名单/缓存：查一次 DoH 并缓存（每个域名每个 isolate 只查一次）
+  try {
+    const list = await resolveIPv4(address);
+    const hosted = list.some((ip) => ipInCloudflare(ip));
+    if (cfHostCache.size > 500) cfHostCache.clear();
+    cfHostCache.set(address, hosted);
+    return hosted;
+  } catch (error) {
+    return false;
+  }
 }
-
 function markCloudflareHost(address) {
   if (!address || isIPv4(address)) return;
   if (cfHostCache.size > 500) cfHostCache.clear();
@@ -1225,19 +1234,30 @@ function createVlessSession(serverWS, forceRelay = false) {
     // 直连被拒（CF 托管站点）时的兜底：交给 proxyip 中转
     async function retry() {
       markCloudflareHost(result.addressRemote);
+      // 固定中转（现在通常为空）→ 公共代理池，逐个兜底
       for (const proxyip of PROXYIPS) {
         const parsed = parseProxyip(proxyip);
         if (!parsed) continue;
         let socket = null;
         try {
-          socket = await connectWithTimeout(parsed, 10000);
+          socket = await connectWithTimeout(parsed, 1500);
           remoteSocket = socket;
           const epoch = ++pipeEpoch;
           pipeRemoteToWebSocket(socket, serverWS, vlessResponseHeader, null, () => epoch === pipeEpoch);
-          console.log('已通过 proxyip', proxyip, '重连');
           return;
         } catch (proxyError) {
           closeSocket(socket);
+        }
+      }
+      if (rawClientData && rawClientData.length) {
+        try {
+          const poolSocket = await raceProxies(result.addressRemote, result.portRemote, rawClientData, 8);
+          remoteSocket = poolSocket;
+          const poolEpoch = ++pipeEpoch;
+          pipeRemoteToWebSocket(poolSocket, serverWS, vlessResponseHeader, null, () => poolEpoch === pipeEpoch);
+          return;
+        } catch (poolError) {
+          console.error('代理池重连失败:', poolError && poolError.message);
         }
       }
       try { serverWS.close(1011, '连接失败'); } catch (error) {}
