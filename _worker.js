@@ -172,7 +172,7 @@ const VISA_NODES = [
   ['www.visaeurope.ch', 2083],
 ];
 
-const PAGE_VERSION = 'v1.0.3';
+const PAGE_VERSION = 'v1.0.6';
 
 // 机房/城市代码 → 中文（没收录的保留原代码）
 const CITY_NAMES = {
@@ -213,6 +213,24 @@ const REGION_NAMES = {
 };
 
 const WS_READY_STATE_OPEN = 1;
+
+// 与 nginx 默认 404 页完全一致（含 CRLF 与结尾换行），避免任何视觉/文本差异
+const NGINX_404_HTML =
+  '<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx/1.24.0</center>\r\n</body>\r\n</html>\r\n';
+const NGINX_404_BYTES = new TextEncoder().encode(NGINX_404_HTML);
+
+function nginx404() {
+  return new Response(NGINX_404_BYTES, {
+    status: 404,
+    headers: {
+      // 尽量对齐「nginx 经 Cloudflare 代理」时客户端看到的响应头
+      server: 'nginx/1.24.0',
+      'content-type': 'text/html',
+      'content-length': String(NGINX_404_BYTES.length),
+      'cf-cache-status': 'DYNAMIC',
+    },
+  });
+}
 
 // 运行期状态：UUID 与「上一次成功抓到的数据」（上游挂了就拿它兜底）
 let userID = UUID;
@@ -264,6 +282,11 @@ export default {
       if (pathname === base + '/cfw') return await handleSubscription(request, 'trojan'); // 老链接兼容
       if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless', 'relay');
       if (pathname === base + '/trojan') return await handleSubscription(request, 'trojan', 'relay');
+      if (pathname === base + '/dl') return await handleDownloadProxy(url);
+      if (pathname === base + '/download') return await handleDownloadIndex(request);
+      if (pathname === base + '/download/flclash') return await handleDownloadPage(request, 'flclash');
+      if (pathname === base + '/download/meta') return await handleDownloadPage(request, 'meta');
+      if (pathname === base + '/download/verge') return await handleDownloadPage(request, 'verge');
       if (pathname === base + '/selftest') return await handleSelftest(request);
       if (pathname === base + '/relay') {
         await loadRelayList();
@@ -313,16 +336,11 @@ export default {
         return new Response(JSON.stringify(out, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       }
     } catch (error) {
-      return new Response('节点数据生成失败：' + (error && error.message), {
-        status: 503,
-        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
-      });
+      // 不向外部暴露内部错误：统一当作不存在
+      return nginx404();
     }
 
-    return new Response('Not Found', {
-      status: 404,
-      headers: { 'content-type': 'text/plain; charset=utf-8' },
-    });
+    return nginx404();
   },
 };
 
@@ -341,15 +359,9 @@ function concatBytes(...parts) {
   return result;
 }
 
-function readUint32BE(bytes, offset) {
-  return (((bytes[offset] << 24) >>> 0) + ((bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3])) >>> 0;
-}
 
-function readBigUint64BE(bytes, offset) {
-  let value = 0;
-  for (let i = 0; i < 8; i++) value = value * 256 + bytes[offset + i];
-  return value;
-}
+
+
 
 const MD5_SHIFT = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
 
@@ -359,43 +371,7 @@ const MD5_TABLE = (() => {
   return table;
 })();
 
-function md5(input) {
-  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  const bitLength = bytes.length * 8;
-  const total = ((bytes.length + 8) >> 6 << 6) + 64;
-  const buffer = new Uint8Array(total);
-  buffer.set(bytes);
-  buffer[bytes.length] = 0x80;
-  const view = new DataView(buffer.buffer);
-  view.setUint32(total - 8, bitLength >>> 0, true);
-  view.setUint32(total - 4, Math.floor(bitLength / 0x100000000), true);
 
-  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
-  const words = new Uint32Array(16);
-  for (let offset = 0; offset < total; offset += 64) {
-    for (let i = 0; i < 16; i++) words[i] = view.getUint32(offset + i * 4, true);
-    let a = a0, b = b0, c = c0, d = d0;
-    for (let i = 0; i < 64; i++) {
-      let f, g;
-      if (i < 16) { f = (b & c) | (~b & d); g = i; }
-      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
-      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
-      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
-      const sum = (f + a + MD5_TABLE[i] + words[g]) >>> 0;
-      a = d; d = c; c = b;
-      b = (b + (((sum << MD5_SHIFT[i]) | (sum >>> (32 - MD5_SHIFT[i]))) >>> 0)) >>> 0;
-    }
-    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
-  }
-
-  const digest = new Uint8Array(16);
-  const outView = new DataView(digest.buffer);
-  outView.setUint32(0, a0, true);
-  outView.setUint32(4, b0, true);
-  outView.setUint32(8, c0, true);
-  outView.setUint32(12, d0, true);
-  return digest;
-}
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -407,11 +383,7 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-function crc32(bytes) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
-}
+
 
 const textEncoder = new TextEncoder();
 
@@ -442,14 +414,7 @@ function isHealthCheckRequest(data) {
   return /^(GET|HEAD)\s+\S*generate_204\S*\s+HTTP\/1\.[01]/i.test(text);
 }
 
-function closeAfterSend(ws, code, reason, delay = 30) {
-  setTimeout(() => {
-    try {
-      if (ws.readyState === WS_READY_STATE_OPEN) ws.close(code, reason);
-    } catch (error) {
-    }
-  }, delay);
-}
+
 
 const isIPv4 = (value) => /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
 
@@ -469,14 +434,7 @@ async function resolveNat64(address) {
   return toNat64(record.data);
 }
 
-async function connectTarget(address, port) {
-  try {
-    return await connectWithTimeout({ hostname: address, port });
-  } catch (error) {
-    const nat64 = await resolveNat64(address);
-    return connectWithTimeout({ hostname: nat64, port });
-  }
-}
+
 
 function isNormalClose(error) {
   const text = `${(error && error.name) || ''} ${(error && error.message) || ''}`;
@@ -914,12 +872,7 @@ async function writeSocketTimed(socket, payload, ms = 3000) {
   }
 }
 
-async function writeSocket(socket, payload) {
-  if (!payload || !payload.length) return;
-  const writer = socket.writable.getWriter();
-  await writer.write(payload);
-  writer.releaseLock();
-}
+
 
 // 依次尝试：直连 → NAT64 → 各个 proxyip。首包要一起写，连 CF 的 IP 时错误在 write 阶段才暴露
 /* ------------------------------------------------------------------
@@ -976,34 +929,7 @@ async function tryProxyip(value, payload) {
   return socket;
 }
 
-async function connectViaPool(payload) {
-  // 粘性候选先试；失败再按列表顺序逐个试（3 秒超时，原来 10 秒太拖）
-  const ordered = [];
-  if (proxyPool.current) ordered.push(proxyPool.current);
-  for (const value of PROXYIPS) {
-    if (!ordered.includes(value)) ordered.push(value);
-  }
 
-  let lastError = null;
-  for (const value of ordered) {
-    try {
-      const socket = await tryProxyip(value, payload);
-      proxyPool.current = value;
-      proxyPool.fails = 0;
-      return socket;
-    } catch (error) {
-      lastError = error;
-      if (value === proxyPool.current) {
-        proxyPool.fails += 1;
-        if (proxyPool.fails >= PROXYIP_FAIL_MAX) {
-          proxyPool.current = null;
-          proxyPool.fails = 0;
-        }
-      }
-    }
-  }
-  throw lastError || new Error('proxyip 全部不可用');
-}
 
 // 数据面回到最朴素的顺序：直连 → NAT64（仅 IPv4）→ 内置的固定中转。
 // 这里不再拉任何远端列表，也不做动态探测，避免每条新连接都要等一次网络请求。
@@ -2221,44 +2147,7 @@ function buildVisaNodes(hostName) {
   }));
 }
 
-// 中转节点：入口与普通节点一样，只是路径多了 ?via=1
-async function buildRelayNodes(hostName, mode = 'c') {
-  const items = await loadRelayList();
-  if (!items.length) return [];
-  const byCountry = new Map();
-  for (const item of items) {
-    if (item.port !== 443 && item.cc !== 'CN') continue;   // 只挑 443；CN 仅 1 条在 53 端口，单独放行
-    if (!HOT_REGIONS.has(item.cc)) continue;
-    const bucket = byCountry.get(item.cc) || [];
-    if (bucket.length >= RELAY_PER_REGION) continue;
-    if (bucket.some((exist) => exist.ip === item.ip)) continue;
-    bucket.push(item);
-    byCountry.set(item.cc, bucket);
-  }
-  const nodes = [];
-  for (const [cc, bucket] of byCountry) {
-    if (!bucket.length) continue;
-    nodes.push({
-      name: countryFlag(cc) + ' ' + (REGION_NAMES[cc] || cc) + '中转',
-      server: hostName,
-      port: 443,
-      uuid: userID,
-      host: hostName,
-      path: WS_PATH + '&mode=' + mode + '&rg=' + cc,
-      tls: true,
-      region: '中转',
-      flag: countryFlag(cc),
-      country: 'RL_' + cc,
-      city: '',
-      speed: 0,
-      latency: 0,
-      score: 0,
-      relayNode: true,
-      relayRegion: cc,
-    });
-  }
-  return nodes;
-}
+
 
 async function buildContext(request, mode = 'relay') {
   const hostName = request.headers.get('Host') || new URL(request.url).host;
@@ -2441,9 +2330,7 @@ function yamlProxy(node, kind, fingerprint = false) {
   return lines.join('\n');
 }
 
-function isDomainNode(node) {
-  return Boolean(node.visaNode || node.hostNode) || /[a-z]/i.test(String(node.server));
-}
+
 
 function yamlGroups(nodes) {
   const pick = (group) => nodes.filter((node) => node.group === group);
@@ -2691,6 +2578,21 @@ const PAGE_JS = `(function () {
   });
 })();`;
 
+// 统一页面外壳：面板与所有下载页共用同一套 <head>/<header>/<main> 结构
+function pageShell({ heading, title, version = '', body, script = '' }) {
+  return '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">\n' +
+    '<meta name="color-scheme" content="light dark">\n' +
+    '<meta name="robots" content="noindex,nofollow">\n' +
+    '<title>' + escapeHtml(title || heading) + '</title>\n' +
+    '<style>' + PAGE_CSS + '</style>\n</head>\n<body>\n<main>\n  <header>\n' +
+    '    <h1>' + escapeHtml(heading) + '</h1>\n' +
+    (version ? '    <span class="ver">' + escapeHtml(version) + '</span>\n' : '') +
+    '  </header>\n' +
+    body +
+    '\n</main>\n' + (script ? '<script>' + script + '</script>\n' : '') + '</body>\n</html>';
+}
+
 function renderPanel(context) {
   const { hostName, nodes, hostNodes, visaNodes, regions, total, unique, sourceUrl, fetchedAt, expireAt, stale, sourceError } = context;
   const base = 'https://' + hostName + '/' + PASSWORD;
@@ -2754,22 +2656,12 @@ ${nodeRows}
     '订阅里还附带 🏠 本机·443 / 🏠 本机·8443 两个节点，直接用部署域名连接；如果只有它们能用、地区节点全超时，说明是数据源里的优选 IP 失效，不是 Worker 的问题。',
   ].map((line) => `<p>${escapeHtml(line)}</p>`).join('\n        ');
 
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<meta name="robots" content="noindex,nofollow">
-<title>免费节点订阅 · ${escapeHtml(hostName)}</title>
-<style>${PAGE_CSS}</style>
-</head>
-<body>
-<main>
-  <header>
-    <h1>免费节点订阅</h1>
-    <span class="ver">${PAGE_VERSION}</span>
-  </header>
+  return pageShell({
+    heading: '免费节点订阅',
+    title: '免费节点订阅 · ' + hostName,
+    version: PAGE_VERSION,
+    script: PAGE_JS,
+    body: `
   <p class="host mono">${escapeHtml(hostName)}</p>
   <div class="stat">
     <span>数据 ${formatTime(fetchedAt)}</span><span>·</span>
@@ -2786,6 +2678,10 @@ ${subRow('Trojan（CFW / Verge 都支持）', 'Trojan · WS + TLS', sub.trojan)}
 ${subRow('VLESS（Clash Verge / Mihomo）', 'VLESS · WS + TLS', sub.vless)}
     </div>
     <p class="hint">「打开 Clash 导入」会直接唤起已经安装的 Clash 客户端；没有反应时先点「复制订阅链接」，再到客户端里粘贴订阅地址。</p>
+    <div class="row">
+      <div class="meta"><span class="name">还没有客户端？</span><span class="tag">FlClash · Clash Meta · Clash Verge</span></div>
+      <div class="act"><a class="btn solid" href="${base}/download">下载客户端</a></div>
+    </div>
   </section>
 
 ${regionSection}
@@ -2810,10 +2706,272 @@ ${regionSection}
       </table>
     </details>
   </section>
-</main>
-<script>${PAGE_JS}</script>
-</body>
-</html>`;
+`,
+  });
+}
+
+// ---------------- 客户端下载页（FlClash / Meta / Verge） ----------------
+const CLIENTS = {
+  flclash: {
+    key: 'flclash',
+    title: 'FlClash',
+    repo: 'chen08209/FlClash',
+    desc: 'Windows / macOS / Linux / Android，界面简洁，支持 Clash 订阅',
+  },
+  meta: {
+    key: 'meta',
+    title: 'Clash Meta for Android',
+    repo: 'MetaCubeX/ClashMetaForAndroid',
+    desc: '仅 Android，Mihomo 内核，功能最全',
+  },
+  verge: {
+    key: 'verge',
+    title: 'Clash Verge Rev',
+    repo: 'clash-verge-rev/clash-verge-rev',
+    desc: 'Windows / macOS / Linux 桌面客户端，Mihomo 内核',
+  },
+};
+const CLIENT_ORDER = ['flclash', 'meta', 'verge'];
+const RELEASE_CACHE = new Map();
+const RELEASE_TTL = 10 * 60 * 1000;
+const KEEP_EXT = ['.apk', '.exe', '.msi', '.zip', '.dmg', '.pkg', '.deb', '.rpm', '.appimage', '.tar.gz'];
+const SKIP_EXT_RE = /\.sig$|\.blockmap$|\.json$|\.ya?ml$|\.txt$/;
+
+function keepAsset(name) {
+  const lower = name.toLowerCase();
+  if (SKIP_EXT_RE.test(lower)) return false;
+  return KEEP_EXT.some((ext) => lower.endsWith(ext));
+}
+
+async function loadRelease(client) {
+  const cached = RELEASE_CACHE.get(client.key);
+  if (cached && cached.data && Date.now() - cached.at < RELEASE_TTL) return cached;
+  const now = Date.now();
+  const entry = { at: now, data: null, error: '' };
+  try {
+    const res = await fetch('https://api.github.com/repos/' + client.repo + '/releases/latest', {
+      headers: { 'user-agent': 'cfnode-worker', accept: 'application/vnd.github+json' },
+    });
+    if (!res.ok) throw new Error('GitHub API HTTP ' + res.status);
+    const json = await res.json();
+    entry.data = {
+      tag: json.tag_name || '',
+      name: json.name || json.tag_name || '',
+      published: json.published_at || '',
+      htmlUrl: json.html_url || ('https://github.com/' + client.repo + '/releases/latest'),
+      assets: (json.assets || [])
+        .filter((a) => keepAsset(a.name))
+        .map((a) => ({ name: a.name, size: a.size, url: a.browser_download_url, dl: a.download_count || 0 })),
+    };
+  } catch (error) {
+    entry.error = (error && error.message) || String(error);
+    try {
+      const fallback = await loadReleaseViaHtml(client);
+      if (fallback.assets.length) {
+        await fillSizes(fallback.assets);
+        entry.data = fallback;
+        entry.error = '';
+      }
+    } catch (fallbackError) {
+      entry.error += ' / HTML 回退失败：' + ((fallbackError && fallbackError.message) || fallbackError);
+    }
+  }
+  RELEASE_CACHE.set(client.key, entry);
+  return entry;
+}
+
+function parseHumanSize(text) {
+  const m = String(text || '').match(/(\d+(?:\.\d+)?)\s*(GB|MB|KB|Bytes?|B)/i);
+  if (!m) return 0;
+  const value = Number(m[1]);
+  const unit = m[2].toUpperCase();
+  if (unit === 'GB') return Math.round(value * 1024 * 1024 * 1024);
+  if (unit === 'MB') return Math.round(value * 1024 * 1024);
+  if (unit === 'KB') return Math.round(value * 1024);
+  return Math.round(value);
+}
+
+async function fillSizes(assets) {
+  const targets = assets.filter((a) => !a.size).slice(0, 24);
+  if (!targets.length) return;
+  await Promise.all(targets.map(async (a) => {
+    try {
+      const res = await fetch(a.url, { method: 'HEAD', redirect: 'follow', headers: { 'user-agent': 'cfnode-worker' } });
+      const len = Number(res.headers.get('content-length') || 0);
+      if (len > 0) a.size = len;
+    } catch (error) {}
+  }));
+}
+
+async function loadReleaseViaHtml(client) {
+  const latest = await fetch('https://github.com/' + client.repo + '/releases/latest', {
+    redirect: 'manual',
+    headers: { 'user-agent': 'cfnode-worker' },
+  });
+  const location = latest.headers.get('location') || '';
+  const tag = location.split('/tag/')[1] || '';
+  if (!tag) throw new Error('拿不到 latest tag');
+  const res = await fetch('https://github.com/' + client.repo + '/releases/expanded_assets/' + tag, {
+    headers: { 'user-agent': 'cfnode-worker' },
+  });
+  if (!res.ok) throw new Error('expanded_assets HTTP ' + res.status);
+  const html = await res.text();
+  const assets = [];
+  const re = /href="(\/[^"]+\/releases\/download\/[^"]+)"[\s\S]{0,240}?<span class="text-bold">([^<]+)<\/span>/g;
+  let match;
+  while ((match = re.exec(html))) {
+    const href = match[1];
+    const name = match[2].trim();
+    if (!keepAsset(name)) continue;
+    const tail = html.slice(match.index, match.index + 260);
+    const parsed = parseHumanSize(tail);
+    assets.push({
+      name,
+      size: parsed >= 1024 && parsed <= 4 * 1024 * 1024 * 1024 ? parsed : 0,
+      url: 'https://github.com' + href,
+      dl: 0,
+    });
+  }
+  return {
+    tag,
+    name: tag,
+    published: '',
+    htmlUrl: 'https://github.com/' + client.repo + '/releases/tag/' + tag,
+    assets,
+  };
+}
+
+function platformOf(name) {
+  const n = name.toLowerCase();
+  if (n.includes('android') || n.endsWith('.apk')) return 'Android';
+  if (n.includes('windows') || /\.(exe|msi)$/.test(n) || n.includes('win')) return 'Windows';
+  if (n.includes('macos') || n.includes('darwin') || /\.(dmg|pkg)$/.test(n) || n.includes('aarch64.app')) return 'macOS';
+  if (n.includes('linux') || /\.(deb|rpm|appimage)$/.test(n)) return 'Linux';
+  return '其他';
+}
+
+function humanSize(bytes) {
+  if (!bytes) return '';
+  if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+}
+
+async function handleDownloadIndex(request) {
+  const url = new URL(request.url);
+  const base = url.origin + '/' + PASSWORD;
+
+  const cards = CLIENT_ORDER.map((key) => {
+    const c = CLIENTS[key];
+    const platforms = key === 'meta' ? 'Android' : (key === 'flclash' ? 'Windows / macOS / Linux / Android' : 'Windows / macOS / Linux');
+    return '    <div class="row">\n' +
+      '      <div class="meta"><span class="name">' + escapeHtml(c.title) + '</span>' +
+      '<span class="tag">' + escapeHtml(platforms) + '</span></div>\n' +
+      '      <div class="act"><a class="btn solid" href="' + escapeHtml(base) + '/download/' + key + '">查看安装包</a></div>\n' +
+      '      <div class="val">' + escapeHtml(c.desc) + '</div>\n' +
+      '    </div>';
+  });
+
+  const html = pageShell({
+    heading: '客户端下载',
+    title: '客户端下载',
+    version: '3 个客户端',
+    body:
+      '  <div class="act" style="margin:0 0 14px"><a class="btn" href="' + escapeHtml(base) + '/">← 返回面板</a></div>\n' +
+      '  <section>\n    <h2>选择客户端</h2>\n    <div class="rows">\n' + cards.join('\n') + '\n    </div>\n  </section>\n' +
+      '  <p class="hint">安装包均由本 Worker 实时读取官方 GitHub 发布页；「通过本站下载」由 Worker 中转，适合 GitHub 直连较慢的网络。</p>',
+  });
+
+  return new Response(html, {
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
+
+async function handleDownloadPage(request, clientKey) {
+  const client = CLIENTS[clientKey] || CLIENTS.flclash;
+  const url = new URL(request.url);
+  const base = url.origin + '/' + PASSWORD;
+  const cached = await loadRelease(client);
+  const data = cached.data;
+  const total = data ? data.assets.length : 0;
+
+  const groups = ['Windows', 'macOS', 'Linux', 'Android', '其他'];
+  const sections = [];
+  if (total) {
+    const bucket = new Map(groups.map((g) => [g, []]));
+    for (const a of data.assets) bucket.get(platformOf(a.name)).push(a);
+    for (const g of groups) {
+      const list = bucket.get(g);
+      if (!list.length) continue;
+      const rows = list.map((a) => {
+        const viaWorker = base + '/dl?u=' + encodeURIComponent(a.url);
+        const size = humanSize(a.size);
+        const tags = (size ? '<span class="tag">' + escapeHtml(size) + '</span>' : '') +
+          (a.dl ? '<span class="tag">下载 ' + a.dl + ' 次</span>' : '');
+        return '      <div class="row">\n' +
+          '        <div class="meta"><span class="name">' + escapeHtml(a.name) + '</span>' + tags + '</div>\n' +
+          '        <div class="act"><a class="btn solid" href="' + escapeHtml(viaWorker) + '">通过本站下载</a>' +
+          '<a class="btn" href="' + escapeHtml(a.url) + '" target="_blank" rel="noopener">GitHub 直链</a></div>\n' +
+          '      </div>';
+      });
+      sections.push('  <section>\n    <h2>' + escapeHtml(g) + ' · ' + list.length + ' 个文件</h2>\n    <div class="rows">\n' +
+        rows.join('\n') + '\n    </div>\n  </section>');
+    }
+  }
+
+  const meta = data
+    ? '版本 <b>' + escapeHtml(data.tag || data.name) + '</b>' +
+      (data.published ? ' · 发布于 ' + escapeHtml(data.published.slice(0, 10)) : '') +
+      ' · 共 ' + total + ' 个文件'
+    : '暂时读取失败（' + escapeHtml(cached.error || '未知原因') + '）';
+  const releasesUrl = data ? data.htmlUrl : 'https://github.com/' + client.repo + '/releases/latest';
+
+  const others = CLIENT_ORDER.filter((k) => k !== client.key)
+    .map((k) => '<a class="btn" href="' + escapeHtml(base) + '/download/' + k + '">' + escapeHtml(CLIENTS[k].title) + '</a>')
+    .join('');
+
+  const body = total
+    ? sections.join('\n')
+    : '  <section><p class="hint">没有取到发布文件列表，可以直接到 <a href="' + escapeHtml(releasesUrl) + '" target="_blank" rel="noopener">GitHub 发布页</a> 下载。</p></section>';
+
+  const html = pageShell({
+    heading: client.title + ' 下载',
+    title: client.title + ' 下载',
+    version: data ? (data.tag || '') : '',
+    body:
+      '  <div class="act" style="margin:0 0 14px;flex-wrap:wrap">' +
+      '<a class="btn" href="' + escapeHtml(base) + '/">← 返回面板</a>' +
+      others +
+      '<a class="btn" href="' + escapeHtml(releasesUrl) + '" target="_blank" rel="noopener">GitHub 发布页</a></div>\n' +
+      '  <p class="hint">' + escapeHtml(client.desc) + ' · ' + meta + '</p>\n' +
+      body +
+      '\n  <p class="hint" style="margin-top:16px">「通过本站下载」由本 Worker 中转 GitHub 上的官方安装包，适合 GitHub 直连较慢的网络；文件较大会持续传输，请耐心等待。</p>',
+  });
+
+  return new Response(html, {
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
+
+async function handleDownloadProxy(url) {
+  const target = url.searchParams.get('u') || '';
+  // 只允许三个客户端官方仓库的 release 资源
+  const allowed = /^https:\/\/github\.com\/(chen08209\/FlClash|MetaCubeX\/ClashMetaForAndroid|clash-verge-rev\/clash-verge-rev)\/releases\/download\//i.test(target);
+  if (!allowed) return new Response('只允许下载官方客户端安装包', { status: 400 });
+  try {
+    const res = await fetch(target, { headers: { 'user-agent': 'cfnode-worker' }, redirect: 'follow' });
+    if (!res.ok) return new Response('下载失败：GitHub 返回 ' + res.status, { status: 502 });
+    let name = 'download';
+    try {
+      name = decodeURIComponent(new URL(target).pathname.split('/').pop() || 'download');
+    } catch (error) {}
+    const headers = new Headers(res.headers);
+    headers.set('content-disposition', 'attachment; filename="' + name.replace(/["\\]/g, '') + '"');
+    headers.set('cache-control', 'no-store');
+    return new Response(res.body, { status: 200, headers });
+  } catch (error) {
+    return new Response('下载失败：' + ((error && error.message) || error), { status: 502 });
+  }
 }
 
 async function handleSelftest(request) {

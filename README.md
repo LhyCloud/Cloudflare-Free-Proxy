@@ -17,6 +17,7 @@
 
 | 版本 | 简介 | 要点 |
 |---|---|---|
+| **v1.0.4** | 新增 FlClash 下载页 | 面板新增「下载 FlClash」入口；新页面 /<密码>/download 实时读取 GitHub 最新 release（API 限流时自动回退解析发布页 HTML），按 Windows/macOS/Linux/Android 分组；支持 /<密码>/dl?u=<github 下载地址> 由 Worker 中转下载（带域名白名单） |
 | **v1.0.3** | 修复配置报错 | 移除顶层 global-client-fingerprint（新版 Mihomo 已删除该项），改为在 Meta 内核的每个节点上写 client-fingerprint: chrome；老内核（CFW）不下发该字段 |
 | **v1.0.1** | 修复延迟检测连接被提前关闭 | 健康检查 204 去掉 Connection: close；同一条隧道内连续请求持续应答 204；关闭延时改为滚动 3 秒（修复 FlClash/Mihomo 报 ailed to get the second response ... closed pipe） |
 | **v1.0.0** | 三组分流 + 全节点入选择 | 两组订阅（`/trojan`、`/vless`）；分组：🚀 节点选择 / 🔀 自动中转 / 🚀 自动直连 / 🛡 自动代理；节点 57 个（优化各 5 个 + 10 个热门地区×≤2，均带图标）；中转按地区绑定（`&mode=relay&rg=XX`）；粘性 10 分钟；`/relay` 可查中转状态 |
@@ -67,6 +68,27 @@
 - 状态查看：`/<密码>/relay`。
 
 **已知限制**：免费中转成功率约 5~7 成；失败会降级（中转组降级到任意中转，仍失败则该连接报错）。要稳定需换成自己的中转 IP（环境变量 `proxyip`，优先级最高）。
+
+---
+## 1.6 客户端下载页（独立页面）
+
+面板里只有一个入口「下载客户端」，下载相关页面全部独立：
+
+| 地址 | 内容 |
+|---|---|
+| `/<密码>/download` | 下载索引：FlClash / Clash Meta for Android / Clash Verge Rev |
+| `/<密码>/download/flclash` | FlClash 安装包（`chen08209/FlClash`） |
+| `/<密码>/download/meta` | Clash Meta for Android（`MetaCubeX/ClashMetaForAndroid`） |
+| `/<密码>/download/verge` | Clash Verge Rev（`clash-verge-rev/clash-verge-rev`） |
+| `/<密码>/dl?u=<编码后的 GitHub 下载地址>` | Worker 中转下载，只允许上面三个仓库的 release 资源 |
+
+实现要点：
+
+- **统一外壳**：面板与全部下载页共用 `pageShell()`（同一 `PAGE_CSS`、同一 `<header>` 结构），没有重复 HTML；
+- **体积来源**：优先 GitHub API 的精确字节数；API 被限流（403）时回退解析发布页 HTML，仍拿不到就用 `HEAD` 请求读 `content-length`；
+- **过滤**：只保留安装包（apk/exe/msi/zip/dmg/pkg/deb/rpm/AppImage/tar.gz），自动剔除 `.sig`、`.blockmap`、`.json`、updater 配置等；
+- **缓存**：每个客户端的 release 信息缓存 10 分钟；
+- **返回按钮**：每个下载页左上角都有「← 返回面板」，并可一键跳到另外两个客户端。
 
 ---
 ## 2. 网页版部署（全程点鼠标，不用命令行）
