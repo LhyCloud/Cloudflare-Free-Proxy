@@ -17,6 +17,8 @@
 
 | 版本 | 简介 | 要点 |
 |---|---|---|
+| **v1.0.3** | 修复配置报错 | 移除顶层 global-client-fingerprint（新版 Mihomo 已删除该项），改为在 Meta 内核的每个节点上写 client-fingerprint: chrome；老内核（CFW）不下发该字段 |
+| **v1.0.1** | 修复延迟检测连接被提前关闭 | 健康检查 204 去掉 Connection: close；同一条隧道内连续请求持续应答 204；关闭延时改为滚动 3 秒（修复 FlClash/Mihomo 报 ailed to get the second response ... closed pipe） |
 | **v1.0.0** | 三组分流 + 全节点入选择 | 两组订阅（`/trojan`、`/vless`）；分组：🚀 节点选择 / 🔀 自动中转 / 🚀 自动直连 / 🛡 自动代理；节点 57 个（优化各 5 个 + 10 个热门地区×≤2，均带图标）；中转按地区绑定（`&mode=relay&rg=XX`）；粘性 10 分钟；`/relay` 可查中转状态 |
 
 ---

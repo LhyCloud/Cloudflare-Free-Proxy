@@ -172,7 +172,7 @@ const VISA_NODES = [
   ['www.visaeurope.ch', 2083],
 ];
 
-const PAGE_VERSION = 'v1.0.0';
+const PAGE_VERSION = 'v1.0.3';
 
 // 机房/城市代码 → 中文（没收录的保留原代码）
 const CITY_NAMES = {
@@ -427,7 +427,9 @@ function noteHealthCheck(bytes, extra = {}) {
   } catch (error) {}
 }
 
-const HEALTH_CHECK_RESPONSE = textEncoder.encode('HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+// 注意：不要带 Connection: close。Mihomo/FlClash 的延迟检测会复用连接读第二次响应，
+// 一收到 close 就报 "failed to get the second response ... closed pipe"。
+const HEALTH_CHECK_RESPONSE = textEncoder.encode('HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n');
 
 function isHealthCheckRequest(data) {
   if (!data || data.length < 16) return false;
@@ -1272,6 +1274,15 @@ function createVlessSession(serverWS, forceRelay = false, pinnedProxy = '', rela
   let remoteSocket = null;
   let vlessResponseHeader = null;
   let firstUserData = true;
+  // 延迟检测模式：同一条隧道里可能连发多次请求，持续应答 204
+  let healthMode = false;
+  let healthTimer = null;
+  const armHealthClose = () => {
+    if (healthTimer) clearTimeout(healthTimer);
+    healthTimer = setTimeout(() => {
+      try { if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.close(1000, '延迟检测完成'); } catch (error) {}
+    }, 3000);
+  };
   let udpStreamWrite = null;
   let isDns = false;
   let targetAddress = '';
@@ -1306,6 +1317,11 @@ function createVlessSession(serverWS, forceRelay = false, pinnedProxy = '', rela
   }
 
   async function feed(chunk) {
+    if (healthMode) {
+      if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+      armHealthClose();
+      return;
+    }
 
     if (isDns && udpStreamWrite) {
       return udpStreamWrite(chunk);
@@ -1317,10 +1333,9 @@ function createVlessSession(serverWS, forceRelay = false, pinnedProxy = '', rela
       awaitingFirstData = false;
       // Clash 的延迟检测就地应答，别去连上游，否则测出来的延迟虚高
       if (isHealthCheckRequest(chunk)) { noteHealthCheck(chunk);
-        if (serverWS.readyState === WS_READY_STATE_OPEN) {
-          serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
-          closeAfterSend(serverWS, 1000, '延迟检测', 30);
-        }
+        healthMode = true;
+        if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+        armHealthClose();
         return;
       }
       try {
@@ -1341,10 +1356,9 @@ function createVlessSession(serverWS, forceRelay = false, pinnedProxy = '', rela
         if (isHealthCheckRequest(chunk)) { noteHealthCheck(chunk);
           closeSocket(remoteSocket);
           remoteSocket = null;
-          if (serverWS.readyState === WS_READY_STATE_OPEN) {
-            serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
-            closeAfterSend(serverWS, 1000, '延迟检测', 30);
-          }
+          healthMode = true;
+          if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+          armHealthClose();
           return;
         }
       }
@@ -1363,8 +1377,9 @@ function createVlessSession(serverWS, forceRelay = false, pinnedProxy = '', rela
     targetPort = result.portRemote;
 
     if (!result.isUDP && isHealthCheckRequest(rawClientData)) { noteHealthCheck(rawClientData);
-      serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
-      closeAfterSend(serverWS, 1000, '延迟检测');
+      healthMode = true;
+      if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(concatBytes(vlessResponseHeader, HEALTH_CHECK_RESPONSE).buffer);
+      armHealthClose();
       return;
     }
 
@@ -1512,6 +1527,16 @@ function createTrojanSession(serverWS, forceRelay = false, pinnedProxy = '', rel
   let buffered = new Uint8Array(0);
   let shut = false;
   let awaiting = null;
+  // 延迟检测模式：Mihomo/FlClash 会在同一条隧道里发第二次请求，
+  // 持续就地应答 204 并滚动延长关闭时间，避免它读到 closed pipe
+  let healthMode = false;
+  let healthTimer = null;
+  const armHealthClose = () => {
+    if (healthTimer) clearTimeout(healthTimer);
+    healthTimer = setTimeout(() => {
+      try { if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.close(1000, '延迟检测完成'); } catch (error) {}
+    }, 3000);
+  };
 
   function shutdown(reason) {
     if (shut) return;
@@ -1523,6 +1548,11 @@ function createTrojanSession(serverWS, forceRelay = false, pinnedProxy = '', rel
   }
 
   async function feed(chunk) {
+    if (healthMode) {
+      if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(HEALTH_CHECK_RESPONSE);
+      armHealthClose();
+      return;
+    }
     if (remote) {
       const writer = remote.writable.getWriter();
       await withTimeout(writer.write(chunk), 8000, '数据转发');
@@ -1535,10 +1565,9 @@ function createTrojanSession(serverWS, forceRelay = false, pinnedProxy = '', rel
       const target = awaiting;
       awaiting = null;
       if (isHealthCheckRequest(chunk)) { noteHealthCheck(chunk);
-        if (serverWS.readyState === WS_READY_STATE_OPEN) {
-          serverWS.send(HEALTH_CHECK_RESPONSE);
-          closeAfterSend(serverWS, 1000, '延迟检测', 30);
-        }
+        healthMode = true;
+        if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(HEALTH_CHECK_RESPONSE);
+        armHealthClose();
         return;
       }
       try {
@@ -1593,10 +1622,9 @@ function createTrojanSession(serverWS, forceRelay = false, pinnedProxy = '', rel
       return;
     }
     if (isHealthCheckRequest(payload)) { noteHealthCheck(payload);
-      if (serverWS.readyState === WS_READY_STATE_OPEN) {
-        serverWS.send(HEALTH_CHECK_RESPONSE);
-        closeAfterSend(serverWS, 1000, '延迟检测', 30);
-      }
+      healthMode = true;
+      if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.send(HEALTH_CHECK_RESPONSE);
+      armHealthClose();
       return;
     }
     try {
@@ -2358,7 +2386,6 @@ log-level: info
 ipv6: false
 tcp-concurrent: true
 find-process-mode: strict
-global-client-fingerprint: chrome
 external-controller: 127.0.0.1:9090
 profile:
   store-selected: true
@@ -2387,7 +2414,7 @@ dns:
 
 const quoteYaml = (value) => JSON.stringify(String(value));
 
-function yamlProxy(node, kind) {
+function yamlProxy(node, kind, fingerprint = false) {
   const trojan = kind === 'trojan';
   const lines = [
     '- name: ' + quoteYaml(node.name),
@@ -2401,8 +2428,9 @@ function yamlProxy(node, kind) {
   if (node.tls) lines.push((trojan ? '  sni: ' : '  servername: ') + quoteYaml(node.host));
   // WebSocket 走 TLS 时必须只用 http/1.1：协商到 h2 时 Upgrade 会被拒，表现为节点连不上
   if (node.tls) lines.push('  alpn:', '    - http/1.1');
+  // 新版 Mihomo 已移除顶层的 global-client-fingerprint，指纹必须写在节点上
+  if (fingerprint) lines.push('  client-fingerprint: chrome');
   if (trojan) lines.push('  skip-cert-verify: false');
-  else lines.push('  client-fingerprint: chrome');
   lines.push('  network: ws');
   lines.push(
     '  ws-opts:',
@@ -2518,7 +2546,7 @@ function yamlDocument(context, kind, meta = false) {
     baseText,
     '',
     'proxies:',
-    nodes.map((node) => yamlProxy(node, kind)).join('\n\n'),
+    nodes.map((node) => yamlProxy(node, kind, meta || kind === 'vless')).join('\n\n'),
     '',
     yamlGroups(nodes),
     '',
