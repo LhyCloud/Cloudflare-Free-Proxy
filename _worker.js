@@ -2933,14 +2933,14 @@ ${nodeRows}
   const notes = [
     '每次打开或刷新页面、每次客户端更新订阅，都会重新抓取数据源并重新挑选节点，不做任何缓存（上游失败时才会退回上一次成功的数据）。',
     '评分 = 带宽 50% + 延迟 50%；同一地区只保留评分最高的 ' + PER_REGION + ' 个，整个订阅最多 ' + MAX_NODES + ' 个。',
-    '两种协议共用同一批节点：/trojan（Trojan，CFW 与 Verge 老内核都支持）、/vless（Clash Verge / Mihomo）。',
-    '访问 x.com / twitter.com 这类 Cloudflare 托管站点时会自动改走 proxyip 中转（Worker 的 connect() 不允许直连 CF 自己的 IP）；普通站点仍然直连，不绕路。',
-    '订阅里固定带一个 🎯 100~200ms 的节点，方便对照测速。',
+    '两种协议共用同一批节点：/cfw（Trojan，CFW 与 Verge 老内核都支持）、/cv（VLESS，Clash Verge / Mihomo）。',
+    '访问 x.com / twitter.com 这类 Cloudflare 托管站点时会自动改走 proxyip 中转（Worker 的 connect() 不允许直连 CF 自己的 IP）；普通站点仍然直连，不绕路。内置 proxyip 都是第三方公共中转，失效属常态。',
+    '「🛡 代理-地区」每个国家锁一条固定出口（v1.0.7 新增，最多 12 个），名字带生成配置时的实测耗时；连接时会并发抢几条，全失败才回落到免费池。',
     '当前 Worker 同时是代理服务端，UUID 与面板密码都写死在代码里；转发落地依赖 Worker 的 NAT64 出口，无需设置 ProxyIP。',
     '订阅响应带 profile-update-interval = ' + UPDATE_INTERVAL_HOURS + ' 小时，Clash Verge / mihomo 会按这个间隔自动更新；Clash for Windows 需要在「订阅」设置里自己填更新间隔。',
     '客户端显示的「已用 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / 总量 ' + formatTraffic(TRAFFIC_TOTAL_BYTES) + '」「到期 24 小时后」来自 subscription-userinfo 响应头，每次刷新都会顺延到新的 24 小时，纯展示用，不影响节点使用。',
     '节点 IP 来自第三方扫描结果，可用性会随时间变化；连不上时换同地区另一个节点即可。',
-    '订阅里还附带 🏠 本机·443 / 🏠 本机·8443 两个节点，直接用部署域名连接；如果只有它们能用、地区节点全超时，说明是数据源里的优选 IP 失效，不是 Worker 的问题。',
+    '订阅里还附带 🇨🇳 本机优化节点（面板展示用，订阅里以 中转-优化 / 直连-优化 / 代理-优化 出现），直接用部署域名连接；如果只有它们能用、地区节点全超时，说明是数据源里的优选 IP 失效，不是 Worker 的问题。',
   ].map((line) => `<p>${escapeHtml(line)}</p>`).join('\n        ');
 
   return pageShell({
