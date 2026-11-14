@@ -4,10 +4,11 @@
 >
 > 本项目仅用于个人学习与技术研究，不提供任何形式的服务保证。使用者应自行确认所在国家/地区的法律法规，因使用本项目产生的一切后果由使用者自行承担。
 >
-> 项目使用的两个上游数据源（全部为公开仓库，节点与代理均非本项目所有）：
+> 项目使用的上游数据源（全部为公开仓库，节点与代理均非本项目所有）：
 >
-> - 中转节点源：**https://github.com/xgonce/Cloudflare_IP** （`NODE_SOURCES`，提供优选 IP 的 IP / 端口 / 带宽 / 延迟 / 地区）
-> - 代理池源：**https://github.com/monosans/proxy-list** （`HTTP_PROXY_SOURCES` / `SOCKS5_PROXY_SOURCES`，提供 `代理-地区` 节点和 CF 站点中转用的公共 HTTP / SOCKS5 代理）
+> - 节点源：**https://github.com/xgonce/Cloudflare_IP** —— `NODE_SOURCES`，提供优选 IP 的 IP / 端口 / 带宽 / 延迟 / 地区
+> - 中转源：**https://github.com/CB-X2-Jun/cf-proxyip-lists** —— `RELAY_LIST_SOURCES`，访问 x.com 等 CF 托管站点时用的中转
+> - 代理池：**https://github.com/monosans/proxy-list** —— `HTTP_PROXY_SOURCES` / `SOCKS5_PROXY_SOURCES`，提供「代理-地区」节点和公共代理出口
 
 ---
 
@@ -199,7 +200,7 @@
 | 节点连不上，ALPN 相关报错 | 客户端声明 ALPN `h2` 时 Cloudflare 选 h2，WebSocket `Upgrade` 永远等不到 `101` | 本版每个节点都带 `alpn: [http/1.1]`；更新订阅即可 |
 | `522` / `1101`，改代码也没用 | 脚本进入冻结态（上传时带了不兼容的兼容标记，或代码与绑定分两次提交） | 删掉脚本重新创建，一次性上传 |
 | `workers.dev` 打开失败 | 该域名在国内被 DNS 污染（会解析到 157.240.x.x） | 绑自有域名 |
-| x.com / twitter.com 打不开 | 这两个站是 Cloudflare 托管，Worker 的 `connect()` 不允许直连 CF 的 IP | 本版会自动改走 proxyip（`PROXYIPS` 内置候选）；普通站点不受影响。内置 proxyip 全是第三方公共中转，失效属常态 |
+| x.com / twitter.com 打不开 | 这两个站是 Cloudflare 托管，Worker 的 `connect()` 不允许直连 CF 的 IP | 用 `🔀 中转-*` 节点（`mode=relay`）：目标落在 CF 网段时自动改走 `CB-X2-Jun/cf-proxyip-lists` 的公共 proxyip；`🚀 直连-*` 节点按设计打不开这两站，`🛡 代理-*` 节点走公共代理 |
 | `代理-地区` 某个国家一直失败 | 免费代理随时会死，判活只代表生成那一刻能连上 | 换同国另一条，或直接用 `代理-优化` / `🔀 自动中转` |
 | `代理-地区` 名字后面没有 `·xxxms` | 这个国家这次一条都没判活，保留的是未验证候选 | 正常现象；连接时会并发抢，全挂回落免费池 |
 | 更新时间/流量显示异常 | `subscription-userinfo` 是写给客户端看的展示字段 | 不影响使用；每次刷新都会顺延 |
