@@ -172,7 +172,7 @@ const VISA_NODES = [
   ['www.visaeurope.ch', 2083],
 ];
 
-const PAGE_VERSION = 'v1.0.6';
+const PAGE_VERSION = 'v1.0.7';
 
 // 机房/城市代码 → 中文（没收录的保留原代码）
 const CITY_NAMES = {
@@ -619,6 +619,232 @@ let httpProxyCache = { list: [], at: 0 };
 // 优先地区：离国内近的先排（按 proxies.json 里的 geolocation.country.iso_code）
 const PREFERRED_COUNTRIES = ['HK', 'TW', 'JP', 'KR', 'SG', 'MY', 'TH', 'VN', 'PH', 'ID', 'IN', 'US', 'DE', 'NL', 'GB'];
 
+/* --------------------------------------------------------------------------
+ * 优质代理：生成配置时按国家挑选固定出口，连接时用 `&mode=proxy&px=种类|地址`
+ * 锁定到这一条代理。它与「代理-优化」互不影响：
+ *   - 代理-优化：每次连接从免费池里竞速，出口不固定；
+ *   - 优质代理：出口锁定（可显示地区），死了才回落到免费池，保证还能上网。
+ * -------------------------------------------------------------------------- */
+const PREMIUM_COUNTRIES = ['HK', 'TW', 'JP', 'SG', 'KR', 'CN', 'US', 'DE', 'GB', 'RU', 'NL', 'CA'];
+const PREMIUM_LIMIT = 12;
+const PREMIUM_TTL = 30 * 60 * 1000;
+const PREMIUM_DEAD_TTL = 10 * 60 * 1000;
+const PREMIUM_TRY_TIMEOUT = 1600;
+// 一个优质代理同时抢几条（每条占一个连接额度，别贪多）
+const PREMIUM_RACE = 3;
+// 生成配置时就地判活：TCP + CONNECT 走两跳，能拿到 200 的才算这个出口能用
+const PREMIUM_PROBE_TIMEOUT = 1200;
+// 一次抽样多少个 IP 反查国家（ip-api 单次上限 100）
+const PREMIUM_SAMPLE = 400;
+const PREMIUM_PROBE_BATCH = 6;
+const PREMIUM_PROBE_TARGET = 'www.gstatic.com';
+// 中国节点够不出去，用百度判活
+const PREMIUM_PROBE_TARGET_CN = 'www.baidu.com';
+// 判活总预算：超过就不等了，已经测出来的照样用
+const PREMIUM_VERIFY_BUDGET = 3000;
+// 订阅请求不能被外部源拖死：单源最多等 5 秒，超时就当这个国家没有
+const PREMIUM_FETCH_TIMEOUT = 5000;
+// proxifly/free-proxy-list 按国家分文件（每国几十 KB，能直接拿到国家，不用解析 1MB 的 proxies.json）
+const premiumSources = (cc) => [
+  'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/' + cc + '/data.txt',
+  'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/' + cc + '/data.txt',
+];
+let premiumCache = { list: [], at: 0 };
+const premiumDead = new Map();
+// 每个优质代理上次连通的那条，10 分钟内直接复用，不再重复抢
+const premiumGood = new Map();
+
+function isPremiumDead(key) {
+  const at = premiumDead.get(key);
+  if (!at) return false;
+  if (Date.now() - at > PREMIUM_DEAD_TTL) { premiumDead.delete(key); return false; }
+  return true;
+}
+
+function markPremiumDead(key) {
+  if (premiumDead.size > 200) premiumDead.clear();
+  premiumDead.set(key, Date.now());
+}
+
+// 单条候选判活：只做到 CONNECT 拿到 200，返回耗时（ms），失败返回 null
+async function probePremiumCandidate(addr, kind, ms = PREMIUM_PROBE_TIMEOUT, target = PREMIUM_PROBE_TARGET) {
+  if (kind !== 'http') return null;
+  const started = Date.now();
+  const colon = addr.lastIndexOf(':');
+  if (colon <= 0) return null;
+  const host = addr.slice(0, colon);
+  const port = Number(addr.slice(colon + 1));
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  let socket = null;
+  try {
+    socket = await connectWithTimeout({ hostname: host, port }, ms);
+    const request = 'CONNECT ' + target + ':80 HTTP/1.1\r\nHost: ' + target + ':80\r\nProxy-Connection: Keep-Alive\r\n\r\n';
+    await writeSocketTimed(socket, new TextEncoder().encode(request), ms);
+    const reader = socket.readable.getReader();
+    let seen = '';
+    try {
+      for (let round = 0; round < 4; round += 1) {
+        const left = ms - (Date.now() - started);
+        if (left <= 0) break;
+        const raced = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), left)),
+        ]);
+        if (raced.timeout || raced.done || !raced.value) break;
+        seen += new TextDecoder().decode(toBytes(raced.value));
+        if (/^HTTP\/1\.[01] 200/.test(seen)) return Date.now() - started;
+        if (/^HTTP\/1\.[01] \d{3}/.test(seen)) break;
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (error) {}
+    }
+    return null;
+  } catch (error) {
+    return null;
+  } finally {
+    closeSocket(socket);
+  }
+}
+
+// 逐批判活（每批 6 条，正好贴着 6 连接上限），只留下真能用的，快的排前面
+async function verifyPremiumPool(list) {
+  // 按国家轮转排队：预算被掐断时每个国家都能轮到自己的一条，不至于后面的国家全是空的
+  const jobs = [];
+  const rounds = list.reduce((max, item) => Math.max(max, item.addrs.length), 0);
+  for (let round = 0; round < rounds; round += 1) {
+    for (const item of list) {
+      const addr = item.addrs[round];
+      if (addr) jobs.push({ cc: item.cc, kind: item.kind, addr });
+    }
+  }
+  const passed = new Map();
+  const deadline = Date.now() + PREMIUM_VERIFY_BUDGET;
+  for (let index = 0; index < jobs.length; index += PREMIUM_PROBE_BATCH) {
+    if (Date.now() > deadline) break;
+    const batch = jobs.slice(index, index + PREMIUM_PROBE_BATCH);
+    // 中国节点够不到 gstatic，用百度判活
+    const settled = await Promise.all(batch.map(async (job) => ({
+      job,
+      rtt: await probePremiumCandidate(job.addr, job.kind, PREMIUM_PROBE_TIMEOUT, job.cc === 'CN' ? PREMIUM_PROBE_TARGET_CN : PREMIUM_PROBE_TARGET),
+    })));
+    for (const row of settled) {
+      if (row.rtt == null) continue;
+      const bucket = passed.get(row.job.cc) || [];
+      bucket.push({ addr: row.job.addr, rtt: row.rtt });
+      passed.set(row.job.cc, bucket);
+    }
+  }
+  const out = [];
+  for (const item of list) {
+    const bucket = (passed.get(item.cc) || []).sort((a, b) => a.rtt - b.rtt).slice(0, PREMIUM_RACE);
+    if (!bucket.length) {
+      // 该地区一条都没判活：保留未验证候选，至少地区覆盖不塌（连接时会并发抢，全挂再回落）
+      out.push({ cc: item.cc, kind: item.kind, addrs: item.addrs.slice(0, PREMIUM_RACE), rtt: null });
+      continue;
+    }
+    out.push({ cc: item.cc, kind: item.kind, addrs: bucket.map((row) => row.addr), rtt: bucket[0].rtt });
+  }
+  return out;
+}
+
+// 带独立超时的抓取（订阅生成路径上用，绝不能等满 SOURCE_TIMEOUT）
+async function fetchTextTimed(url, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'user-agent': 'Mozilla/5.0 (compatible; cf-node-sub/1.0)', accept: 'text/plain,*/*' },
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+﻿// 按国家各取 3 条候选（http CONNECT 优先，其次 socks5），缓存 30 分钟。
+// 免费代理的存活率只有两三成，所以同一地区备 3 条，连接时并发抢，谁通算谁。
+async function fetchPremiumPool() {
+  if (premiumCache.list.length && Date.now() - premiumCache.at < PREMIUM_TTL) return premiumCache.list;
+  // 免费代理池里 proxifly 那批活不到 5%，改成从已经在用的 monosans 池抽样，再批量反查国家
+  let sample = [];
+  try {
+    const pool = await loadHttpProxies();
+    if (Array.isArray(pool) && pool.length) sample = pickProxies(pool, PREMIUM_SAMPLE);
+  } catch (error) { sample = []; }
+  if (!sample.length) return premiumCache.list || [];
+  const geo = await geoLookupCountries(sample);
+  const byCountry = new Map();
+  for (const addr of sample) {
+    const cc = geo.get(addr);
+    if (!cc || !PREMIUM_COUNTRIES.includes(cc)) continue;
+    const bucket = byCountry.get(cc) || [];
+    if (bucket.length >= PREMIUM_RACE * 2) continue;
+    bucket.push(addr);
+    byCountry.set(cc, bucket);
+  }
+  const candidates = [];
+  for (const cc of PREMIUM_COUNTRIES) {
+    const bucket = byCountry.get(cc);
+    if (bucket && bucket.length) candidates.push({ cc, kind: 'http', addrs: bucket, rtt: null });
+  }
+  if (!candidates.length) return premiumCache.list || [];
+  let verified = [];
+  try { verified = await verifyPremiumPool(candidates); } catch (error) { verified = []; }
+  // 判活几乎全挂时退回未验证的，至少订阅结构不塌
+  const list = (verified.length ? verified : candidates).slice(0, PREMIUM_LIMIT);
+  premiumCache = { list, at: Date.now() };
+  return list;
+}
+
+// ip-api 批量反查国家：单请求上限 100 个 IP，多则并发分批（批量接口不烧配额）
+async function geoLookupCountries(addrs) {
+  const out = new Map();
+  if (!addrs.length) return out;
+  const chunks = [];
+  for (let index = 0; index < addrs.length; index += 100) chunks.push(addrs.slice(index, index + 100));
+  const settled = await Promise.allSettled(chunks.map(async (chunk) => {
+    const response = await fetch('http://ip-api.com/batch?fields=status,countryCode,query', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(chunk.map((addr) => addr.slice(0, addr.lastIndexOf(':')))),
+    });
+    if (!response.ok) return [];
+    const rows = await response.json();
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row, index) => {
+      if (!row || row.status !== 'success' || !row.countryCode) return null;
+      return [chunk[index], String(row.countryCode).toUpperCase()];
+    }).filter(Boolean);
+  }));
+  for (const row of settled) {
+    if (row.status !== 'fulfilled' || !row.value) continue;
+    for (const [addr, cc] of row.value) if (addr) out.set(addr, cc);
+  }
+  return out;
+}
+
+// 解析 `&px=http|1.2.3.4:8080,5.6.7.8:3128`（一个地区最多 3 条备胎）
+function parsePinnedProxy(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const bar = raw.indexOf('|');
+  const kind = (bar >= 0 ? raw.slice(0, bar) : 'http').toLowerCase();
+  if (kind !== 'http' && kind !== 'socks5') return null;
+  const addrs = (bar >= 0 ? raw.slice(bar + 1) : raw)
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => /^[^\s|,:]+:\d{1,5}$/.test(item))
+    .filter((item) => {
+      const port = Number(item.slice(item.lastIndexOf(':') + 1));
+      return Number.isInteger(port) && port >= 1 && port <= 65535;
+    });
+  if (!addrs.length) return null;
+  return { kind, addrs, key: kind + '|' + addrs[0] };
+}
+
 async function fetchProxyList(sources) {
   const seen = new Set();
   for (const source of sources) {
@@ -1046,6 +1272,27 @@ async function openTargetInner(address, port, payload, forceRelay = false, pinne
 
   // 自动代理：全部走代理池
   if (mode === 'proxy') {
+    // 优质代理：同地区并发抢几条，先到先用；全挂才回落免费池
+    const pinned = parsePinnedProxy(pinnedProxy);
+    if (pinned && !isPremiumDead(pinned.key)) {
+      const connectOne = (addr) => (pinned.kind === 'socks5'
+        ? connectViaSocks5Proxy(addr, address, port, payload, PREMIUM_TRY_TIMEOUT)
+        : connectViaHttpProxy(addr, address, port, payload, PREMIUM_TRY_TIMEOUT));
+      const cached = premiumGood.get(pinned.key);
+      // 上次连通的那条排最前，但不单独连：它变慢时不能拖住整条链路
+      const order = cached ? [cached].concat(pinned.addrs.filter((addr) => addr !== cached)) : pinned.addrs;
+      const attempts = order.slice(0, PREMIUM_RACE).map((addr) => connectOne(addr).then((socket) => ({ socket, addr })));
+      try {
+        const winner = await Promise.any(attempts);
+        premiumGood.set(pinned.key, winner.addr);
+        attempts.forEach((pending) => pending.then((item) => {
+          if (item.addr !== winner.addr) closeSocket(item.socket);
+        }).catch(() => {}));
+        return winner.socket;
+      } catch (error) {
+        markPremiumDead(pinned.key);
+      }
+    }
     return raceProxies(address, port, payload, 8);
   }
 
@@ -2147,7 +2394,40 @@ function buildVisaNodes(hostName) {
   }));
 }
 
-
+// 优质代理节点：每条锁定一个国家/地区的一条固定出口（名字里带地区，方便一眼看出来）
+async function buildPremiumNodes(hostName) {
+  let pool = [];
+  try {
+    pool = await fetchPremiumPool();
+  } catch (error) {
+    pool = [];
+  }
+  const nodes = [];
+  for (const item of pool) {
+    if (nodes.length >= PREMIUM_LIMIT) break;
+    const code = String(item.cc || '').toUpperCase();
+    const region = REGION_NAMES[code] || code;
+    nodes.push({
+      name: countryFlag(code) + ' 代理-' + region + ' ' + (nodes.length + 1) + (item.rtt ? '·' + item.rtt + 'ms' : ''),
+      server: hostName,
+      port: 443,
+      uuid: userID,
+      host: hostName,
+      path: WS_PATH + '&mode=proxy&px=' + encodeURIComponent(item.kind + '|' + item.addrs.join(',')),
+      tls: true,
+      region: '优质代理',
+      flag: countryFlag(code),
+      country: code,
+      city: '',
+      speed: 0,
+      latency: 0,
+      score: 0,
+      group: 'proxy',
+      premiumNode: true,
+    });
+  }
+  return nodes;
+}
 
 async function buildContext(request, mode = 'relay') {
   const hostName = request.headers.get('Host') || new URL(request.url).host;
@@ -2190,6 +2470,8 @@ async function buildContext(request, mode = 'relay') {
     group: 'proxy',
     relayNode: false,
   }));
+  // 优质代理：只在「自动代理」组里追加，不改动上面 5 个代理-优化的行为
+  const proxyPremium = await buildPremiumNodes(hostName);
 
   // 地区节点（优选 IP，热门地区每区最多 2 个）：同样派生「中转」和「直连」
   const relayRegionNodes = [];
@@ -2216,7 +2498,7 @@ async function buildContext(request, mode = 'relay') {
     });
   }
 
-  const nodes = relayOptimized.concat(relayRegionNodes).concat(directOptimized).concat(directRegionNodes).concat(proxyOptimized);
+  const nodes = relayOptimized.concat(relayRegionNodes).concat(directOptimized).concat(directRegionNodes).concat(proxyOptimized).concat(proxyPremium);
   if (!nodes.length) throw new Error(snapshot.error || '没有可用节点');
 
   return {
@@ -2332,7 +2614,7 @@ function yamlProxy(node, kind, fingerprint = false) {
 
 
 
-function yamlGroups(nodes) {
+function yamlGroups(nodes, meta = false) {
   const pick = (group) => nodes.filter((node) => node.group === group);
   const build = (name, list, extra = []) => {
     if (!list.length) return null;
@@ -2356,7 +2638,7 @@ function yamlGroups(nodes) {
   if (relayList.length) menu.push('    - 🔀 自动中转');
   if (directList.length) menu.push('    - 🚀 自动直连');
   if (proxyList.length) menu.push('    - 🛡 自动代理');
-  menu.push('    - DIRECT');
+  menu.push('    - ' + (meta ? '不使用节点' : 'DIRECT'));
 
   groups.push([
     '- name: 🚀 节点选择',
@@ -2429,13 +2711,18 @@ function yamlDocument(context, kind, meta = false) {
     .replace(/^ {4}- '__HOST__'$/m, fakeIpFilter)
     .replace(/__HOST__/g, context.hostName);
 
+  const useMeta = meta || kind === 'vless';
+  // Mihomo 支持 type: direct，可以给"直连"起一个中文名；老内核只能用内置的 DIRECT
+  const directProxy = useMeta ? ['- name: 不使用节点', '  type: direct'].join('\n') : null;
+
   return head.concat([
     baseText,
     '',
     'proxies:',
-    nodes.map((node) => yamlProxy(node, kind, meta || kind === 'vless')).join('\n\n'),
+    ...(directProxy ? [directProxy] : []),
+    nodes.map((node) => yamlProxy(node, kind, useMeta)).join('\n\n'),
     '',
-    yamlGroups(nodes),
+    yamlGroups(nodes, useMeta),
     '',
   ], rules).join('\n') + '\n';
 }
