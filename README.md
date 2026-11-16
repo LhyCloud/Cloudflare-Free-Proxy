@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/icon.svg" alt="Cloudflare 免费代理" width="88">
+<img src="assets/icon.svg" alt="Cloudflare 免费代理" width="128">
 
 # Cloudflare Free Proxy
 
@@ -14,6 +14,10 @@
 
 </div>
 
+> [!WARNING]
+> **若所在国家不允许使用代理服务，请勿下载和部署该项目！**
+> 本项目仅用于个人学习与技术研究，不提供任何服务保证；节点与代理均来自第三方公开仓库，非本项目所有。使用者请自行确认当地法律法规，一切后果由使用者自行承担。
+> 
 <!-- 面板截图（真实 PNG 待补，先把位置留好；补好后取消下面注释即可）
 <p align="center">
   <picture>
@@ -215,10 +219,6 @@
 | **v1.0.3** | 修复配置报错 | 移除顶层 `global-client-fingerprint`（新版 Mihomo 已删该项），改为在 Meta 内核每个节点上写 `client-fingerprint: chrome`；老内核不下发 |
 | **v1.0.1** | 修复延迟检测连接被提前关闭 | 健康检查 204 去掉 `Connection: close`；同一隧道内连续请求持续就地应答 204；关闭延时改为滚动延长（修 `failed to get the second response ... closed pipe`） |
 | **v1.0.0** | 三组分流 + 全节点入选择 | 两组订阅；分组 🚀 节点选择 / 🔀 自动中转 / 🚀 自动直连 / 🛡 自动代理；中转按地区绑定（`&mode=relay&rg=XX`）；粘性 10 分钟 |
-
-> [!WARNING]
-> **若所在国家不允许使用代理服务，请勿下载和部署该项目！**
-> 本项目仅用于个人学习与技术研究，不提供任何服务保证；节点与代理均来自第三方公开仓库，非本项目所有。使用者请自行确认当地法律法规，一切后果由使用者自行承担。
 
 ## 目录
 
