@@ -36,7 +36,7 @@
 - **代理-地区节点**：从免费池抽样、批量反查国家，按 12 个地区各挑一个固定出口，节点名直接带地区与实测耗时；连接时锁定那一台，全挂才回落。
 - **延迟检测就地应答**：客户端的 `generate_204` 由 Worker 直接回 `204`，不连上游，测出来就是纯链路 RTT。
 - **面板带密码**：`/<密码>/` 一键唤起 Clash 导入、复制订阅、看每个地区的延迟与带宽，另有下载页与排障页。
-- **客户端展示**：`subscription-userinfo` 显示已用 114 T / 总量 514 T、到期 24 小时（滚动）；`profile-update-interval` 6 小时自动更新。
+- **客户端展示**：`subscription-userinfo` 显示已用 114 T / 总量 514 T、到期 7 天（滚动顺延）；`profile-update-interval` 6 小时自动更新。
 
 ## 部署
 
@@ -65,7 +65,7 @@
 
 | 位置 | 期望 |
 |---|---|
-| 面板右上角 | 版本号 `v1.0.7` |
+| 面板右上角 | 版本号 `v1.0.7b`；页面大标题是 `Cloudflare免费代理`（可用 `PANEL_TITLE` 改） |
 | 面板「地区」区块 | 每个地区 2 个节点，能看到延迟 / 带宽 / 评分 |
 | `https://<域名>/<密码>/selftest` | `"ok": true`，且 `tcp www.baidu.com:80` 是 `ok ... 「HTTP/1.1 200 OK」` |
 
@@ -191,6 +191,7 @@
 
 | 常量 | 默认 | 作用 |
 |---|---|---|
+| `PANEL_TITLE` | `Cloudflare免费代理` | 面板标题：页面大标题、浏览器标签页、下载页标签前缀都取它；改这一处就能整套换名，不影响订阅和节点 |
 | `PASSWORD` | `cfnode2026` | 面板与订阅路径的密码 |
 | `UUID` / `TROJAN_PASSWORD` | 内置 | VLESS 的 UUID / Trojan 口令 |
 | `NODE_SOURCES` | `xgonce/Cloudflare_IP` | 节点数据源；支持仓库地址、raw/CSV 直链、`ip:port` 文本 |
@@ -204,13 +205,14 @@
 | `PREMIUM_VERIFY_BUDGET` / `PREMIUM_PROBE_TIMEOUT` | `3000` / `1200` | 判活总预算 / 单条超时（毫秒） |
 | `PREMIUM_TTL` / `PREMIUM_DEAD_TTL` | 30 分钟 / 10 分钟 | 代理池缓存有效期 / 坏代理冷却 |
 | `UPDATE_INTERVAL_HOURS` | `6` | 下发给客户端的订阅更新间隔 |
-| `TRAFFIC_USED_BYTES` / `TRAFFIC_TOTAL_BYTES` / `EXPIRE_SECONDS` | 114 T / 514 T / 24 h | 客户端显示的流量与到期 |
-| `PAGE_VERSION` | `v1.0.7` | 面板右上角版本号 |
+| `TRAFFIC_USED_BYTES` / `TRAFFIC_TOTAL_BYTES` / `EXPIRE_SECONDS` | 114 T / 514 T / 7 天 | 客户端显示的流量与到期（面板文案由 `EXPIRE_LABEL` 自动跟随：整天按「N 天」，否则按小时） |
+| `PAGE_VERSION` | `v1.0.7b` | 面板右上角版本号 |
 
 ## 版本记录
 
 | 版本 | 简介 | 要点 |
 |---|---|---|
+| **v1.0.7b** | 面板标题可配置 | 新增 `PANEL_TITLE` 常量（默认 `Cloudflare免费代理`），面板大标题、浏览器标签页、下载页标签前缀统一由它决定；订阅与代理逻辑未改 |
 | **v1.0.7** | 新增「代理-地区」节点 | 从免费池抽样，用 ip-api 批量反查国家，按 12 个地区各挑固定出口，用真实 `CONNECT` 判活（中国节点测百度，其余测 gstatic），判活预算 3 秒；节点名带实测耗时；连接参数 `&mode=proxy&px=种类\|地址` 锁定出口，全挂才回落免费池。「代理-优化」和其余机制完全未改 |
 | **v1.0.6b** | 「直连」改名「不使用节点」 | Meta 内核支持 `type: direct`，订阅里下发 `- name: 不使用节点`；老内核（CFW）仍用内置 `DIRECT` |
 | **v1.0.6** | 瘦身 | 删掉 10 个已被替代的函数（`crc32`、`md5`、`connectTarget`、`buildRelayNodes` 等），体积 126,500 → 121,655 字节，行为不变 |

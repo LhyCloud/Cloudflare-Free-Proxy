@@ -37,23 +37,35 @@
 import { connect } from 'cloudflare:sockets';
 
 /* ==========================================================================
- * 配置
+ * 用户配置（部署时建议修改，避免被盗用）
  * ========================================================================== */
+ 
+// 面板标题：浏览器标签页 + 页面大标题（下载页会带上前缀）；纯展示，改这里就能整套换名
+const PANEL_TITLE = 'Cloudflare免费代理';
 
-// 面板 / 订阅路径里的密码：只有 /<PASSWORD>/... 能访问（写死在这里即可）
+const PAGE_VERSION = 'v1.0.7b';
+
+// 面板 / 订阅路径里的密码：只有 /<PASSWORD>/... 能访问
 const PASSWORD = 'cfnode2026';
 
 // VLESS / Trojan 共用的 UUID（可在 Pages 环境变量里用 uuid 覆盖）
 const UUID = 'e921a2ec-2c5c-4987-a303-35984326d3d7';
 
-// 节点数据源 = url.txt 里的项目地址（支持 GitHub 仓库、raw 地址、或任意 CSV/TXT 地址）
-const NODE_SOURCES = ['https://github.com/xgonce/Cloudflare_IP'];
+// Trojan 口令（与 VLESS 共用同一批优选 IP，只是协议不同）
+const TROJAN_PASSWORD = 'cfnode-trojan-2026';
 
 // 每个地区保留几个节点
 const PER_REGION = 2;
 
 // 生成的配置最多包含多少个节点
 const MAX_NODES = 160;
+
+/* ==========================================================================
+ * 代理配置
+ * ========================================================================== */
+
+// 节点数据源 = url.txt 里的项目地址（支持 GitHub 仓库、raw 地址、或任意 CSV/TXT 地址）
+const NODE_SOURCES = ['https://github.com/xgonce/Cloudflare_IP'];
 
 // WebSocket 路径（与客户端配置一致）
 const WS_PATH = '/?ed=2560';
@@ -71,13 +83,12 @@ const MAX_LATENCY = 600;
 const UPDATE_INTERVAL_HOURS = 6;
 
 // 订阅信息：客户端里显示的「已用 / 总量 / 到期」
-// 1 T = 1024^4 字节；到期时间每次请求都重新算，也就是永远显示「还有 1 天」
+// 1 T = 1024^4 字节；到期时间每次请求都重新算，也就是永远显示「还有 7 天」
 const TRAFFIC_USED_BYTES = 114 * 1024 ** 4;
 const TRAFFIC_TOTAL_BYTES = 514 * 1024 ** 4;
-const EXPIRE_SECONDS = 24 * 3600;
-
-// Trojan 口令（与 VLESS 共用同一批优选 IP，只是协议不同）
-const TROJAN_PASSWORD = 'cfnode-trojan-2026';
+const EXPIRE_SECONDS = 7 * 24 * 3600;
+// 到期文案：整天的按「N 天」显示，否则按小时（改了 EXPIRE_SECONDS 后文案自动跟着变）
+const EXPIRE_LABEL = EXPIRE_SECONDS % 86400 === 0 ? EXPIRE_SECONDS / 86400 + ' 天' : Math.round(EXPIRE_SECONDS / 3600) + ' 小时';
 
 // 访问 x.com / twitter.com 这类「Cloudflare 托管站点」的中转（proxyip）。
 // Worker 的 connect() 不允许直连 Cloudflare 自己的 IP（会报 Stream was cancelled），
@@ -171,8 +182,6 @@ const VISA_NODES = [
   ['www.visa.com.br', 2087],
   ['www.visaeurope.ch', 2083],
 ];
-
-const PAGE_VERSION = 'v1.0.7';
 
 // 机房/城市代码 → 中文（没收录的保留原代码）
 const CITY_NAMES = {
@@ -2945,14 +2954,14 @@ ${nodeRows}
     '「🛡 代理-地区」每个国家锁一条固定出口（v1.0.7 新增，最多 12 个），名字带生成配置时的实测耗时；连接时会并发抢几条，全失败才回落到免费池。',
     '当前 Worker 同时是代理服务端，UUID 与面板密码都写死在代码里；转发落地依赖 Worker 的 NAT64 出口，无需设置 ProxyIP。',
     '订阅响应带 profile-update-interval = ' + UPDATE_INTERVAL_HOURS + ' 小时，Clash Verge / mihomo 会按这个间隔自动更新；Clash for Windows 需要在「订阅」设置里自己填更新间隔。',
-    '客户端显示的「已用 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / 总量 ' + formatTraffic(TRAFFIC_TOTAL_BYTES) + '」「到期 24 小时后」来自 subscription-userinfo 响应头，每次刷新都会顺延到新的 24 小时，纯展示用，不影响节点使用。',
+    '客户端显示的「已用 ' + formatTraffic(TRAFFIC_USED_BYTES) + ' / 总量 ' + formatTraffic(TRAFFIC_TOTAL_BYTES) + '」「到期还有 ' + EXPIRE_LABEL + '」来自 subscription-userinfo 响应头，每次刷新都会顺延到新的 ' + EXPIRE_LABEL + '，纯展示用，不影响节点使用。',
     '节点 IP 来自第三方扫描结果，可用性会随时间变化；连不上时换同地区另一个节点即可。',
     '订阅里还附带 🇨🇳 本机优化节点（面板展示用，订阅里以 中转-优化 / 直连-优化 / 代理-优化 出现），直接用部署域名连接；如果只有它们能用、地区节点全超时，说明是数据源里的优选 IP 失效，不是 Worker 的问题。',
   ].map((line) => `<p>${escapeHtml(line)}</p>`).join('\n        ');
 
   return pageShell({
-    heading: 'Cloudflare免费代理',
-    title: 'Cloudflare免费代理 · ' + hostName,
+    heading: PANEL_TITLE,
+    title: PANEL_TITLE + ' · ' + hostName,
     version: PAGE_VERSION,
     script: PAGE_JS,
     body: `
@@ -2962,7 +2971,7 @@ ${nodeRows}
     <span>${total} 条记录 / ${unique} 个地址</span><span>·</span>
     <span>${regions.length} 个地区 / ${nodes.length} 个节点</span><span>·</span>
     <span>流量 ${formatTraffic(TRAFFIC_USED_BYTES)} / ${formatTraffic(TRAFFIC_TOTAL_BYTES)}</span><span>·</span>
-    <span>到期 ${formatShortTime(expireAt * 1000)}（24 小时）</span>${stale ? '<span>·</span><span>⚠️ 上游暂时不可用，正在使用上次的数据</span>' : ''}
+    <span>到期 ${formatShortTime(expireAt * 1000)}（${EXPIRE_LABEL}）</span>${stale ? '<span>·</span><span>⚠️ 上游暂时不可用，正在使用上次的数据</span>' : ''}
   </div>
 
   <section>
@@ -3168,7 +3177,7 @@ async function handleDownloadIndex(request) {
 
   const html = pageShell({
     heading: '客户端下载',
-    title: '客户端下载',
+    title: PANEL_TITLE + ' · 客户端下载',
     version: '3 个客户端',
     body:
       '  <div class="act" style="margin:0 0 14px"><a class="btn" href="' + escapeHtml(base) + '/">← 返回面板</a></div>\n' +
@@ -3230,7 +3239,7 @@ async function handleDownloadPage(request, clientKey) {
 
   const html = pageShell({
     heading: client.title + ' 下载',
-    title: client.title + ' 下载',
+    title: PANEL_TITLE + ' · ' + client.title + ' 下载',
     version: data ? (data.tag || '') : '',
     body:
       '  <div class="act" style="margin:0 0 14px;flex-wrap:wrap">' +
