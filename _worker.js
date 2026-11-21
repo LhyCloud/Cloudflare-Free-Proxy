@@ -43,7 +43,7 @@ import { connect } from 'cloudflare:sockets';
 // 面板标题：浏览器标签页 + 页面大标题（下载页会带上前缀）；纯展示，改这里就能整套换名
 const PANEL_TITLE = 'Cloudflare免费代理';
 
-const PAGE_VERSION = 'v1.0.7b';
+const PAGE_VERSION = 'v1.0.8';
 
 // 面板 / 订阅路径里的密码：只有 /<PASSWORD>/... 能访问
 const PASSWORD = 'cfnode2026';
@@ -131,10 +131,39 @@ const INCLUDE_VISA_NODES = true;
 const HOT_REGIONS = new Set(['HK', 'TW', 'JP', 'KR', 'SG', 'US', 'CA', 'GB', 'DE', 'NL', 'FR', 'AU', 'MY', 'TH', 'VN', 'PH', 'ID', 'MO', 'NZ']);
 
 // 中转代理池：社区维护的 CF 反代 IP（非 CF 的 IP:端口:国家码）
+// 中转池来源（按价值排序，单源失败不影响其它源）
+// 1/2：CB-X2-Jun 主池（ip:port:CC，59 个地区但没有 KR/SG）
+// 3/4：ymyuuu/IPDB（ip#CC，正好补 KR/SG/JP 这类主池缺的地区）
+// 5  ：xgonce 的 result.csv（带 IP,端口,速度,归属国，用来补地区+参考带宽）
 const RELAY_LIST_SOURCES = [
-  'https://raw.githubusercontent.com/CB-X2-Jun/cf-proxyip-lists/main/proxyip.txt',
   'https://cdn.jsdelivr.net/gh/CB-X2-Jun/cf-proxyip-lists@main/proxyip.txt',
+  'https://raw.githubusercontent.com/CB-X2-Jun/cf-proxyip-lists/main/proxyip.txt',
+  'https://cdn.jsdelivr.net/gh/ymyuuu/IPDB@main/BestProxy/bestproxy%26country.txt',
+  'https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestProxy/bestproxy&country.txt',
+  'https://cdn.jsdelivr.net/gh/xgonce/Cloudflare_IP@main/result.csv',
 ];
+// 第二个中转仓库（Xiaobei09/proxyip）：按国家分目录，good_v4_top 是「IPv4 + 优质」档，
+// 主仓库缺某个地区时用它补，而不是拿别的地区顶替、也不再写死 IP
+const RELAY_ALT_SOURCES = (cc) => [
+  'https://cdn.jsdelivr.net/gh/Xiaobei09/proxyip@main/data/valid/countries/' + cc + '/good_v4_top.txt',
+  'https://cdn.jsdelivr.net/gh/Xiaobei09/proxyip@main/data/valid/countries/' + cc + '/good_v4.txt',
+];
+// 纯净中转：用 x.com 的 /cdn-cgi/trace 现场验出站，只留「IPv4 出站 + 能上推」的机器
+const PURE_TARGET_HOST = 'x.com';
+const PURE_LIMIT = 1;
+const PURE_SAMPLE = 16;
+const PURE_RACE = 4;
+const PURE_PROBE_TIMEOUT = 6000;
+const PURE_TTL = 2 * 60 * 60 * 1000;
+const PURE_DEAD_TTL = 15 * 60 * 1000;
+let pureCache = { list: [], at: 0 };
+const pureDead = new Map();
+const pureOk = new Map();   // 上次连通的时间，用来「优先复用刚才能用的那条」
+let pureProbing = false;
+let runtimeCtx = null;   // 有些路由拿不到 ctx，这里存一份给后台任务用
+const pureDebug = { tried: 0, noConnect: 0, tlsFail: 0, ipv6: 0, httpFail: 0, ok: 0, lastHead: '', lastError: '' };
+const RELAY_ALT_TTL = 30 * 60 * 1000;
+const relayAltCache = new Map();
 const RELAY_PER_REGION = 2;
 const RELAY_FALLBACK = ["185.253.117.26:443:FR","185.253.117.147:443:FR","45.192.203.14:443:JP","35.192.203.14:443:JP","217.60.240.59:443:DE","217.60.240.94:443:DE","202.155.95.132:443:ID","172.232.245.102:443:ID","103.208.85.78:443:NZ","185.71.230.237:443:NZ","20.17.111.31:443:MY","202.61.74.174:443:MY","188.255.156.143:443:US","182.255.84.231:443:US","34.80.145.45:443:TW","45.207.158.134:443:TW","165.101.65.72:443:TH","101.108.49.121:443:TH","152.175.5.161:443:HK","38.207.165.159:443:HK","178.253.32.76:443:MO","45.207.34.68:443:MO","94.183.159.167:443:NL","94.183.177.104:443:NL","61.245.11.45:443:PH","61.245.10.8:443:PH","166.1.228.218:443:CA","103.197.185.178:443:VN","161.248.31.198:443:VN","138.124.116.236:443:GB","147.45.77.176:443:GB"];
 const RELAY_TTL = 30 * 60 * 1000;
@@ -142,20 +171,42 @@ let relayListCache = { items: [], at: 0 };
 
 async function loadRelayList() {
   if (relayListCache.items.length && Date.now() - relayListCache.at < RELAY_TTL) return relayListCache.items;
-  for (const source of RELAY_LIST_SOURCES) {
-    try {
-      const text = await fetchText(source);
-      const items = [];
-      for (const line of String(text).split(/\r?\n/)) {
-        const match = line.trim().match(/^([0-9]{1,3}(?:\.[0-9]{1,3}){3}):(\d{1,5})(?::([A-Za-z]{2}))?$/);
-        if (!match) continue;
-        items.push({ ip: match[1], port: Number(match[2]), cc: String(match[3] || '').toUpperCase() });
+  // 多源并行抓，任何一个成功就有池子；三种格式都认：
+  //   ip:port:CC（CB） / ip#CC（ymyuuu） / CSV: IP,cf-meta-ip,端口,速度,归属国,机房...
+  const merged = new Map();
+  const add = (ip, port, cc) => {
+    if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) return;
+    const num = Number(port);
+    if (!num) return;
+    const key = ip + ':' + num;
+    if (merged.has(key)) return;
+    merged.set(key, { ip, port: num, cc: String(cc || '').toUpperCase() });
+  };
+  const settled = await Promise.allSettled(RELAY_LIST_SOURCES.map(async (source) => ({
+    text: await fetchTextTimed(source, 6000),
+  })));
+  for (const row of settled) {
+    if (row.status !== 'fulfilled') continue;
+    for (const line of String(row.value.text).split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('IP,')) continue;
+      if (trimmed.includes(',')) {
+        const cells = trimmed.split(',');
+        add(cells[0], cells[2], cells[4]);
+        continue;
       }
-      if (items.length) {
-        relayListCache = { items, at: Date.now() };
-        return items;
-      }
-    } catch (error) {}
+      const match = trimmed.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?([#:,].*)?$/);
+      if (!match) continue;
+      const tail = match[3] || '';
+      const ccMatch = tail.match(/([A-Za-z]{2})/);
+      add(match[1], match[2] || 443, ccMatch ? ccMatch[1] : '');
+    }
+    if (merged.size >= 1500) break;
+  }
+  const items = Array.from(merged.values()).slice(0, 1500);
+  if (items.length) {
+    relayListCache = { items, at: Date.now() };
+    return items;
   }
   // 远端列表拉不到：退回内置兜底池，保证中转节点不会消失
   const fallbackItems = [];
@@ -257,6 +308,7 @@ export default {
    * @returns {Promise<Response>}
    */
   async fetch(request, env, ctx) {
+    runtimeCtx = ctx || null;
     userID = (env && (env.uuid || env.UUID)) || UUID;
     // 控制台环境变量可配自己的中转（逗号分隔，如 1.2.3.4:443），优先于公共池
     if (env && env.proxyip) {
@@ -291,9 +343,102 @@ export default {
       if (pathname === base + '/icon.svg') {
         return new Response(FAVICON_SVG, { headers: { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'public, max-age=86400' } });
       }
-      if (pathname === base + '/cfw') return await handleSubscription(request, 'trojan'); // 老链接兼容
-      if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless', 'relay');
-      if (pathname === base + '/trojan') return await handleSubscription(request, 'trojan', 'relay');
+      if (pathname === base + '/pure/try') {
+        // 调试：单独验一台代理（?addr=ip:port），过了就直接进纯净池
+        const addr = url.searchParams.get('addr') || '';
+        let result = null;
+        try { result = await probePureRelay({ addr }, PURE_PROBE_TIMEOUT); } catch (error) {}
+        if (result) {
+          const key = addr;
+          const rows = pureCache.list.filter((item) => item.addr !== key);
+          rows.unshift({ key, addr, egressIp: result.ip, egressLoc: result.loc, city: result.city || '', rtt: result.ms, reliable: Boolean(result.reliable) });
+          pureCache = { list: rows.slice(0, 20), at: Date.now() };
+        }
+        return new Response(JSON.stringify({ addr, result, debug: pureDebug, good: pureCache.list.length }), {
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      }
+      if (pathname === base + '/pure') {
+        const rows = pureCache.list.map((item) => ({ key: item.key, egressIp: item.egressIp, loc: item.egressLoc, rtt: item.rtt }));
+        return new Response(JSON.stringify({ debug: pureDebug, good: rows, dead: pureDead.size, cacheAt: pureCache.at }), {
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      }
+      if (pathname === base + '/hs/speed') {
+        const bytes = Math.min(524288, Math.max(1024, Number(url.searchParams.get('bytes')) || HS_SPEED_BYTES));
+        const body = new Uint8Array(bytes);
+        for (let index = 0; index < bytes; index += 1) body[index] = (index * 31 + 7) & 255;
+        return new Response(body, {
+          headers: {
+            'content-type': 'application/octet-stream',
+            'cache-control': 'no-store',
+            'content-length': String(bytes),
+          },
+        });
+      }
+      // 自动高速的现状（调试用）：看这个 isolate 里记住了哪些高质 IP
+      if (pathname === base + '/hs') return handleHighSpeedStatus();
+      // 单条中转试测（调试用）：?ip=1.2.3.4&port=443
+      if (pathname === base + '/rq/try') {
+        const ip = String(url.searchParams.get('ip') || '').trim();
+        const port = Number(url.searchParams.get('port') || 443);
+        const target = runtimeHost || new URL(url.toString()).host;
+        const item = { key: ip + ':' + port, ip, port, cc: '' };
+        const record = ip ? await probeRelayQuality(item, target, 9000) : null;
+        return new Response(JSON.stringify({ pageVersion: PAGE_VERSION, item, target, record }, null, 2), {
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      }
+      // 中转出口质量现状（调试用）：实测带宽、各地区机器数
+      if (pathname === base + '/rq') {
+        let pool = [];
+        try { pool = await loadRelayList(); } catch (error) {}
+        const rqHost = runtimeHost || new URL(url.toString()).host;
+        if (url.searchParams.get('run') !== '0') kickRelayQuality(rqHost, 6);
+        const regions = {};
+        for (const item of pool) { const cc = item.cc || '??'; regions[cc] = (regions[cc] || 0) + 1; }
+        const rows = Array.from(relayQuality.entries()).map(([key, record]) => ({ key, mbps: record.mbps, rtt: record.rtt, got: record.got, ageSec: Math.round((Date.now() - record.at) / 1000) }))
+          .sort((a, b) => b.mbps - a.mbps);
+        return new Response(JSON.stringify({ pageVersion: PAGE_VERSION, pool: pool.length, regions, stats: relayStats, quality: rows }, null, 2), {
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      }
+      if (pathname === base + '/px') {
+        // 代理池现状（调试用）：顺手跑一次完整流程，这样看到的数字就是「同一次请求、同一个 isolate」的
+        if (url.searchParams.get('run') !== '0') {
+          try { await fetchPremiumPool(); } catch (error) { premiumDebug.runError = (error && error.message) || String(error); }
+        }
+        // 抽了多少、探了多少、明文/TLS 各成功几次、最后留下哪些
+        const sources = [];
+        for (const source of HTTP_PROXY_SOURCES) {
+          const started = Date.now();
+          try {
+            const text = await fetchTextTimed(source, PROXY_SOURCE_TIMEOUT);
+            const lines = String(text).split(/\r?\n/).filter((line) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(line.trim()));
+            sources.push({ source, ok: true, bytes: String(text).length, lines: lines.length, ms: Date.now() - started });
+          } catch (error) {
+            sources.push({ source, ok: false, error: (error && error.message) || String(error), ms: Date.now() - started });
+          }
+        }
+        const body = { version: PAGE_VERSION, debug: premiumDebug, cacheSize: (premiumCache.list || []).length, egressCached: premiumEgressCache.size, sources, list: premiumCache.list || [], at: premiumCache.at };
+        return new Response(JSON.stringify(body, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      }
+      // 单条带宽探测（调试用）：/<密码>/hs/try?ip=1.2.3.4:443&kind=relay
+      if (pathname === base + '/hs/try') {
+        const raw = String(url.searchParams.get('ip') || '');
+        const kind = String(url.searchParams.get('kind') || 'relay');
+        const matched = raw.match(/^([^:\s]+):(\d{1,5})$/);
+        if (!matched) return new Response(JSON.stringify({ error: 'ip 参数要写成 ip:port' }), { status: 400, headers: { 'content-type': 'application/json' } });
+        const trace = [];
+        const started = Date.now();
+        const result = await hsTlsProbe(kind, matched[1], Number(matched[2]), new URL(request.url).host, trace);
+        return new Response(JSON.stringify({ result, trace, ms: Date.now() - started, tlsBroken: hsTlsBroken }, null, 2), {
+          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+        });
+      }
+      if (pathname === base + '/cfw') return await handleSubscription(request, 'trojan', 'relay', ctx); // 老链接兼容
+      if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless', 'relay', ctx);
+      if (pathname === base + '/trojan') return await handleSubscription(request, 'trojan', 'relay', ctx);
       if (pathname === base + '/dl') return await handleDownloadProxy(url);
       if (pathname === base + '/download') return await handleDownloadIndex(request);
       if (pathname === base + '/download/flclash') return await handleDownloadPage(request, 'flclash');
@@ -614,8 +759,10 @@ function markCloudflareHost(address) {
 // 实时代理列表（monosans/proxy-list，社区每小时更新）。用 HTTP CONNECT 方式当中转：
 // 连上代理 → CONNECT 目标:443 → 之后原样转发 TLS 字节，相当于一个非 CF 的出口。
 const HTTP_PROXY_SOURCES = [
-  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
   'https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/http.txt',
+  'https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/http.txt',
+  'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt',
+  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
 ];
 const PROXY_JSON_SOURCES = [
   'https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies.json',
@@ -626,6 +773,7 @@ const SOCKS5_PROXY_SOURCES = [
   'https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/socks5.txt',
 ];
 const HTTP_PROXY_TTL = 30 * 60 * 1000;
+const PROXY_SOURCE_TIMEOUT = 3500;   // 单个代理列表源的抓取上限（并行，互不拖累）
 let httpProxyCache = { list: [], at: 0 };
 
 // 优先地区：离国内近的先排（按 proxies.json 里的 geolocation.country.iso_code）
@@ -639,7 +787,7 @@ const PREFERRED_COUNTRIES = ['HK', 'TW', 'JP', 'KR', 'SG', 'MY', 'TH', 'VN', 'PH
  * -------------------------------------------------------------------------- */
 const PREMIUM_COUNTRIES = ['HK', 'TW', 'JP', 'SG', 'KR', 'CN', 'US', 'DE', 'GB', 'RU', 'NL', 'CA'];
 const PREMIUM_LIMIT = 12;
-const PREMIUM_TTL = 30 * 60 * 1000;
+const PREMIUM_TTL = 2 * 60 * 60 * 1000;   // 高质代理清单缓存 2 小时（判活/出口国家也缓存 2 小时）
 const PREMIUM_DEAD_TTL = 10 * 60 * 1000;
 const PREMIUM_TRY_TIMEOUT = 1600;
 // 一个优质代理同时抢几条（每条占一个连接额度，别贪多）
@@ -647,13 +795,13 @@ const PREMIUM_RACE = 3;
 // 生成配置时就地判活：TCP + CONNECT 走两跳，能拿到 200 的才算这个出口能用
 const PREMIUM_PROBE_TIMEOUT = 1200;
 // 一次抽样多少个 IP 反查国家（ip-api 单次上限 100）
-const PREMIUM_SAMPLE = 400;
-const PREMIUM_PROBE_BATCH = 6;
+const PREMIUM_SAMPLE = 160;
+const PREMIUM_PROBE_BATCH = 10;
 const PREMIUM_PROBE_TARGET = 'www.gstatic.com';
 // 中国节点够不出去，用百度判活
 const PREMIUM_PROBE_TARGET_CN = 'www.baidu.com';
 // 判活总预算：超过就不等了，已经测出来的照样用
-const PREMIUM_VERIFY_BUDGET = 3000;
+const PREMIUM_VERIFY_BUDGET = 5000;
 // 订阅请求不能被外部源拖死：单源最多等 5 秒，超时就当这个国家没有
 const PREMIUM_FETCH_TIMEOUT = 5000;
 // proxifly/free-proxy-list 按国家分文件（每国几十 KB，能直接拿到国家，不用解析 1MB 的 proxies.json）
@@ -665,22 +813,46 @@ let premiumCache = { list: [], at: 0 };
 const premiumDead = new Map();
 // 每个优质代理上次连通的那条，10 分钟内直接复用，不再重复抢
 const premiumGood = new Map();
+// 判活结果缓存（v1.0.9）：同一个地址 30 分钟内不重测，配置被反复生成也不烧连接额度
+const premiumProbeCache = new Map();
+// 出口国家缓存：代理注册地 ≠ 实际出口地（香港机器从美国出去很常见），节点名按真实出口写
+const premiumEgressCache = new Map();
+let premiumVerifying = false;   // 后台判活是否在跑（一次只跑一份）
+// 观测用：/px 里能看到这一轮到底抽了多少、探了多少、明文/TLS 各成功几次
+let premiumDebug = { pool: 0, sampled: 0, jobs: 0, probed: 0, plainOk: 0, tlsOk: 0, at: 0 };
+// 阶梯冷却：失败 1/2/3/4 次 → 30s/2min/5min/10min，成功立刻清零（旧版是一刀切 10 分钟）
+const PREMIUM_COOLDOWN = [30 * 1000, 2 * 60 * 1000, 5 * 60 * 1000, 10 * 60 * 1000];
+const PREMIUM_OK_TTL = 2 * 60 * 60 * 1000;   // 判活 + 出口国家缓存 2 小时
+const PREMIUM_EGRESS_BUDGET = 3000;         // 兜底测出口国家的总预算
+const PREMIUM_EGRESS_TIMEOUT = 4200;        // 单条「穿代理查出口」的超时（TLS 一轮约 4 个 RTT，太快会把能用的也砍掉）
+const PREMIUM_WAIT = 1500;                  // 生成配置时最多等代理池这么久，超了就用缓存（后台继续测，下次请求就有）
 
-function isPremiumDead(key) {
-  const at = premiumDead.get(key);
-  if (!at) return false;
-  if (Date.now() - at > PREMIUM_DEAD_TTL) { premiumDead.delete(key); return false; }
-  return true;
+// 返回「还要等到什么时候」：0 表示现在就能试。旧代码只有一个布尔值，失败一次压 10 分钟，
+// 慢恢复的代理会被反复压死；阶梯冷却让「偶发抖动」只停 30 秒。
+function premiumWaitUntil(key) {
+  const record = premiumDead.get(key);
+  if (!record) return 0;
+  return record.until > Date.now() ? record.until : 0;
 }
-
+function isPremiumDead(key) { return premiumWaitUntil(key) > 0; }
 function markPremiumDead(key) {
   if (premiumDead.size > 200) premiumDead.clear();
-  premiumDead.set(key, Date.now());
+  const record = premiumDead.get(key) || { fails: 0, until: 0 };
+  record.fails += 1;
+  record.until = Date.now() + PREMIUM_COOLDOWN[Math.min(record.fails - 1, PREMIUM_COOLDOWN.length - 1)];
+  premiumDead.set(key, record);
+}
+function notePremiumOk(key) {
+  if (premiumDead.has(key)) premiumDead.delete(key);
 }
 
-// 单条候选判活：只做到 CONNECT 拿到 200，返回耗时（ms），失败返回 null
+// 单条候选判活（v1.0.9）：CONNECT 200 只是「弱证据」，再往隧道里起一次真 TLS，
+// 拿到 ServerHello 并收到 HTTP 状态行才算「强证据」。只建连的假活就是在这里被筛掉的。
 async function probePremiumCandidate(addr, kind, ms = PREMIUM_PROBE_TIMEOUT, target = PREMIUM_PROBE_TARGET) {
   if (kind !== 'http') return null;
+  if (String(addr).includes(']:') || /^\[[0-9a-f:]+\]/.test(String(addr))) return null;   // 不用 IPv6 出口
+  const cached = premiumProbeCache.get(addr);
+  if (cached && Date.now() - cached.at < PREMIUM_OK_TTL) return cached.rtt;
   const started = Date.now();
   const colon = addr.lastIndexOf(':');
   if (colon <= 0) return null;
@@ -688,12 +860,14 @@ async function probePremiumCandidate(addr, kind, ms = PREMIUM_PROBE_TIMEOUT, tar
   const port = Number(addr.slice(colon + 1));
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
   let socket = null;
+  let tls = null;
   try {
     socket = await connectWithTimeout({ hostname: host, port }, ms);
-    const request = 'CONNECT ' + target + ':80 HTTP/1.1\r\nHost: ' + target + ':80\r\nProxy-Connection: Keep-Alive\r\n\r\n';
-    await writeSocketTimed(socket, new TextEncoder().encode(request), ms);
-    const reader = socket.readable.getReader();
+    const request = 'CONNECT ' + target + ':443 HTTP/1.1\r\nHost: ' + target + ':443\r\nProxy-Connection: Keep-Alive\r\n\r\n';
+    await writeSocketTimed(socket, textEncoder.encode(request), ms);
     let seen = '';
+    let tunnelOpen = false;
+    const reader = socket.readable.getReader();
     try {
       for (let round = 0; round < 4; round += 1) {
         const left = ms - (Date.now() - started);
@@ -704,13 +878,83 @@ async function probePremiumCandidate(addr, kind, ms = PREMIUM_PROBE_TIMEOUT, tar
         ]);
         if (raced.timeout || raced.done || !raced.value) break;
         seen += new TextDecoder().decode(toBytes(raced.value));
-        if (/^HTTP\/1\.[01] 200/.test(seen)) return Date.now() - started;
+        if (/^HTTP\/1\.[01] 200/.test(seen)) { tunnelOpen = true; break; }
         if (/^HTTP\/1\.[01] \d{3}/.test(seen)) break;
       }
     } finally {
       try { reader.releaseLock(); } catch (error) {}
     }
+    if (!tunnelOpen) return null;
+    if (typeof socket.startTls !== 'function') {
+      // 运行时没有 startTls：退化成弱证据（CONNECT 200），但标记一下，方便 /hs 里看出来
+      hsTlsBroken = true;
+      premiumProbeCache.set(addr, { rtt: Date.now() - started, at: Date.now() });
+      return Date.now() - started;
+    }
+    tls = socket.startTls({ expectedServerHostname: target });
+    await withTimeout(tls.opened || Promise.resolve(), Math.max(200, ms - (Date.now() - started)), 'TLS 握手');
+    const head = 'HEAD /generate_204 HTTP/1.1\r\nHost: ' + target + '\r\nUser-Agent: px-probe\r\nConnection: close\r\n\r\n';
+    await writeSocketTimed(tls, textEncoder.encode(head), ms);
+    const stats = await hsReadSome(tls, Math.max(200, ms - (Date.now() - started)), 1024);
+    if (!/^HTTP\/1\.[01] (200|204)/.test(stats.text)) return null;
+    const rtt = Date.now() - started;
+    if (premiumProbeCache.size > 400) premiumProbeCache.clear();
+    premiumProbeCache.set(addr, { rtt, at: Date.now() });
+    return rtt;
+  } catch (error) {
     return null;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+// 查真实出口：CONNECT ip-api.com:80 再发 GET /json，返回 { ip, cc, country, city }
+// 只有穿过代理拿到的 countryCode 才是「这条代理从哪儿上网」，ip-api 查代理 IP 本身查的是注册地
+async function probeProxyEgress(addr, ms = PREMIUM_PROBE_TIMEOUT) {
+  const cached = premiumEgressCache.get(addr);
+  if (cached && Date.now() - cached.at < PREMIUM_OK_TTL) return cached.value;
+  const colon = addr.lastIndexOf(':');
+  if (colon <= 0) return null;
+  const host = addr.slice(0, colon);
+  const port = Number(addr.slice(colon + 1));
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  let socket = null;
+  const started = Date.now();
+  try {
+    socket = await connectWithTimeout({ hostname: host, port }, ms);
+    await writeSocketTimed(socket, textEncoder.encode('CONNECT ip-api.com:80 HTTP/1.1\r\nHost: ip-api.com:80\r\nProxy-Connection: Keep-Alive\r\n\r\n'), ms);
+    const reader = socket.readable.getReader();
+    let head = '';
+    try {
+      for (let round = 0; round < 4; round += 1) {
+        const left = ms - (Date.now() - started);
+        if (left <= 0) break;
+        const raced = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), left)),
+        ]);
+        if (raced.timeout || raced.done || !raced.value) break;
+        head += new TextDecoder().decode(toBytes(raced.value));
+        if (/^HTTP\/1\.[01] 200/.test(head)) break;
+        if (/^HTTP\/1\.[01] \d{3}/.test(head)) return null;
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (error) {}
+    }
+    if (!/^HTTP\/1\.[01] 200/.test(head)) return null;
+    const request = 'GET /json?fields=status,countryCode,country,city,query HTTP/1.1\r\nHost: ip-api.com\r\nUser-Agent: px-egress\r\nAccept: */*\r\nConnection: close\r\n\r\n';
+    await writeSocketTimed(socket, textEncoder.encode(request), ms);
+    const stats = await hsReadSome(socket, Math.max(400, ms - (Date.now() - started)), 2048);
+    const start = stats.text.indexOf('{');
+    const end = stats.text.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    const json = JSON.parse(stats.text.slice(start, end + 1));
+    if (!json || json.status !== 'success' || !json.countryCode) return null;
+    const value = { ip: String(json.query || ''), cc: String(json.countryCode).toUpperCase(), country: String(json.country || ''), city: String(json.city || '') };
+    if (premiumEgressCache.size > 400) premiumEgressCache.clear();
+    premiumEgressCache.set(addr, { value, at: Date.now() });
+    return value;
   } catch (error) {
     return null;
   } finally {
@@ -718,45 +962,669 @@ async function probePremiumCandidate(addr, kind, ms = PREMIUM_PROBE_TIMEOUT, tar
   }
 }
 
+// 穿代理查出口（主判活方式，v1.0.8）：CONNECT www.cloudflare.com:443 → 隧道内 TLS →
+// GET /cdn-cgi/trace，回复里 ip= 是这条代理的真实出口，loc= 是国家代码。一次探测同时得到
+// 「通不通」「从哪出去」「多快」，比只认 CONNECT 200 强，也比查代理 IP 注册地准。
+async function probeProxyEgressTls(addr, ms = PREMIUM_EGRESS_TIMEOUT) {
+  const cached = premiumEgressCache.get(addr);
+  if (cached && Date.now() - cached.at < PREMIUM_OK_TTL) return cached.value;
+  const colon = addr.lastIndexOf(':');
+  if (colon <= 0) return null;
+  const host = addr.slice(0, colon);
+  const port = Number(addr.slice(colon + 1));
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const target = 'www.cloudflare.com';
+  let socket = null;
+  let tls = null;
+  const started = Date.now();
+  try {
+    // 必须是 starttls 模式：workerd 在 secureTransport:'off' 的 socket 上调 startTls() 会抛错，
+    // 这就是上一版「代理一个都测不出出口」的原因（connectWithTimeout 走的是默认 off）。
+    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), ms, 'TCP 握手');
+    await writeSocketTimed(socket, textEncoder.encode('CONNECT ' + target + ':443 HTTP/1.1\r\nHost: ' + target + ':443\r\nProxy-Connection: Keep-Alive\r\n\r\n'), ms);
+    const reader = socket.readable.getReader();
+    let head = '';
+    try {
+      for (let round = 0; round < 4; round += 1) {
+        const left = ms - (Date.now() - started);
+        if (left <= 0) break;
+        const raced = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), left)),
+        ]);
+        if (raced.timeout || raced.done || !raced.value) break;
+        head += new TextDecoder().decode(toBytes(raced.value));
+        if (/^HTTP\/1\.[01] 200/.test(head)) break;
+        if (/^HTTP\/1\.[01] \d{3}/.test(head)) return null;
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (error) {}
+    }
+    if (!/^HTTP\/1\.[01] 200/.test(head)) return null;
+    if (typeof socket.startTls !== 'function') {
+      hsTlsBroken = true;
+      return null;
+    }
+    tls = socket.startTls({ expectedServerHostname: target });
+    await withTimeout(tls.opened || Promise.resolve(), Math.max(300, ms - (Date.now() - started)), 'TLS 握手');
+    const request = 'GET /cdn-cgi/trace HTTP/1.1\r\nHost: ' + target + '\r\nUser-Agent: px-egress\r\nAccept: */*\r\nConnection: close\r\n\r\n';
+    await writeSocketTimed(tls, textEncoder.encode(request), ms);
+    const stats = await hsReadSome(tls, Math.max(400, ms - (Date.now() - started)), 2048);
+    if (!/HTTP\/1\.[01] 200/.test(stats.text)) return null;
+    const ipMatch = stats.text.match(/\nip=([^\r\n]+)/);
+    const locMatch = stats.text.match(/\nloc=([A-Za-z]{2})/);
+    if (!ipMatch) return null;
+    const value = { ip: ipMatch[1].trim(), cc: locMatch ? locMatch[1].toUpperCase() : '', country: '', city: '', ms: Date.now() - started };
+    if (premiumEgressCache.size > 400) premiumEgressCache.clear();
+    premiumEgressCache.set(addr, { value, at: Date.now() });
+    return value;
+  } catch (error) {
+    return null;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+// 判活（v1.0.8）：CONNECT www.gstatic.com:443 → 隧道内 TLS → HEAD /generate_204
+// 只要握手起来并拿到 200/204 就算这条代理是活的（这也是数据面真正干的事）
+async function probeProxyTlsAlive(addr, ms = PREMIUM_EGRESS_TIMEOUT) {
+  const colon = addr.lastIndexOf(':');
+  if (colon <= 0) return 0;
+  const host = addr.slice(0, colon);
+  const port = Number(addr.slice(colon + 1));
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return 0;
+  const target = 'www.gstatic.com';
+  let socket = null;
+  let tls = null;
+  const started = Date.now();
+  try {
+    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), ms, 'TCP 握手');
+    await writeSocketTimed(socket, textEncoder.encode('CONNECT ' + target + ':443 HTTP/1.1\r\nHost: ' + target + ':443\r\nProxy-Connection: Keep-Alive\r\n\r\n'), ms);
+    const reader = socket.readable.getReader();
+    let head = '';
+    try {
+      for (let round = 0; round < 4; round += 1) {
+        const left = ms - (Date.now() - started);
+        if (left <= 0) break;
+        const raced = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), left)),
+        ]);
+        if (raced.timeout || raced.done || !raced.value) break;
+        head += new TextDecoder().decode(toBytes(raced.value));
+        if (/^HTTP\/1\.[01] 200/.test(head)) break;
+        if (/^HTTP\/1\.[01] \d{3}/.test(head)) return 0;
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (error) {}
+    }
+    if (!/^HTTP\/1\.[01] 200/.test(head)) return 0;
+    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; return 0; }
+    tls = socket.startTls({ expectedServerHostname: target });
+    await withTimeout(tls.opened || Promise.resolve(), Math.max(600, ms - (Date.now() - started)), 'TLS 握手');
+    await writeSocketTimed(tls, textEncoder.encode('HEAD /generate_204 HTTP/1.1\r\nHost: ' + target + '\r\nUser-Agent: px-alive\r\nConnection: close\r\n\r\n'), ms);
+    const stats = await hsReadSome(tls, Math.max(600, ms - (Date.now() - started)), 512);
+    if (!/^HTTP\/1\.[01] (200|204)/.test(stats.text)) return 0;
+    return Date.now() - started;
+  } catch (error) {
+    return 0;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+// 兜底标注：强证据判活全挂时，至少把「出口国家」测准。
+// 只放单条地址、只按真实出口贴标签——旧版是拿「代理注册地」凑数，所以地区经常对不上。
+async function labelByEgress(candidates) {
+  const probes = [];
+  for (const item of candidates) {
+    const addr = (item.addrs || [])[0];
+    if (addr) probes.push({ item, addr });
+  }
+  const out = [];
+  const seen = new Set();
+  const deadline = Date.now() + PREMIUM_EGRESS_BUDGET;
+  for (let index = 0; index < probes.length; index += PREMIUM_PROBE_BATCH) {
+    if (Date.now() > deadline) break;
+    const batch = probes.slice(index, index + PREMIUM_PROBE_BATCH);
+    const settled = await Promise.all(batch.map(async (job) => ({ job, egress: await probeProxyEgress(job.addr, PREMIUM_PROBE_TIMEOUT) })));
+    for (const row of settled) {
+      const egress = row.egress;
+      if (!egress || !PREMIUM_COUNTRIES.includes(egress.cc) || seen.has(egress.cc)) continue;
+      seen.add(egress.cc);
+      out.push({ cc: egress.cc, kind: 'http', addrs: [row.job.addr], rtt: null, egressIp: egress.ip, egressCity: egress.city });
+    }
+  }
+  return out;
+}
+
 // 逐批判活（每批 6 条，正好贴着 6 连接上限），只留下真能用的，快的排前面
 async function verifyPremiumPool(list) {
-  // 按国家轮转排队：预算被掐断时每个国家都能轮到自己的一条，不至于后面的国家全是空的
+  // 判活方式（v1.0.8）：直接「穿过代理」访问 ip-api.com，一次往返同时拿到
+  //   ① 这条代理到底通不通（能拿到 JSON 就是通了，比 CONNECT 200 强得多）
+  //   ② 它真实的出口国家（节点名就按这个写，不再用代理注册地冒充）
   const jobs = [];
   const rounds = list.reduce((max, item) => Math.max(max, item.addrs.length), 0);
   for (let round = 0; round < rounds; round += 1) {
     for (const item of list) {
       const addr = item.addrs[round];
-      if (addr) jobs.push({ cc: item.cc, kind: item.kind, addr });
+      if (addr) jobs.push({ cc: item.cc, addr });
     }
   }
   const passed = new Map();
+  premiumDebug.jobs = jobs.length;
+  premiumDebug.at = Date.now();
   const deadline = Date.now() + PREMIUM_VERIFY_BUDGET;
   for (let index = 0; index < jobs.length; index += PREMIUM_PROBE_BATCH) {
-    if (Date.now() > deadline) break;
+    const left = deadline - Date.now();
+    if (left < 300) break;
+    const budget = Math.min(PREMIUM_EGRESS_TIMEOUT, left);
     const batch = jobs.slice(index, index + PREMIUM_PROBE_BATCH);
-    // 中国节点够不到 gstatic，用百度判活
-    const settled = await Promise.all(batch.map(async (job) => ({
-      job,
-      rtt: await probePremiumCandidate(job.addr, job.kind, PREMIUM_PROBE_TIMEOUT, job.cc === 'CN' ? PREMIUM_PROBE_TARGET_CN : PREMIUM_PROBE_TARGET),
-    })));
+    const settled = await Promise.allSettled(batch.map(async (job) => {
+      const started = Date.now();
+      premiumDebug.probed += 1;
+      // 先走明文版：CONNECT + 一个 GET 就能问出「这条代理的出口在哪」，
+      // 比 TLS 版少两个往返，同样的预算能多测一倍候选。明文不通再补 TLS 版。
+      // 明文只当快速筛（很多代理只放 443，明文注定不通），真正的判活看 TLS
+      // ① 明文出口（顺带判活，很多代理只放 443 所以只当加分项）
+      const plain = await probeProxyEgress(job.addr, Math.min(1200, budget));
+      if (plain) premiumDebug.plainOk += 1;
+      // ② TLS 判活：这条能过，说明数据面真能用
+      const aliveMs = plain ? Date.now() - started : await probeProxyTlsAlive(job.addr, budget);
+      if (!aliveMs) return { job, egress: null, ms: 0 };
+      if (!plain) premiumDebug.tlsOk += 1;
+      // ③ 出口国家：明文拿不到就试 CF trace，再拿不到就用注册地（用户实测注册地多数是对的）
+      let egress = plain;
+      if (!egress) egress = await probeProxyEgressTls(job.addr, Math.min(1400, budget));
+      const country = egress ? egress.cc : job.cc;
+      return { job, egress: { cc: country, ip: egress ? egress.ip : '' }, ms: aliveMs };
+    }));
     for (const row of settled) {
-      if (row.rtt == null) continue;
-      const bucket = passed.get(row.job.cc) || [];
-      bucket.push({ addr: row.job.addr, rtt: row.rtt });
-      passed.set(row.job.cc, bucket);
+      if (row.status !== 'fulfilled' || !row.value) continue;
+      if (!row.value.egress || !row.value.egress.cc) continue;
+      const cc = row.value.egress.cc;
+      if (!PREMIUM_COUNTRIES.includes(cc)) continue;   // 出口不在目标国家：不生成
+      const bucket = passed.get(cc) || [];
+      if (bucket.length >= PREMIUM_RACE * 2) continue;
+      bucket.push({ addr: row.value.job.addr, rtt: row.value.ms, egress: row.value.egress });
+      passed.set(cc, bucket);
     }
   }
   const out = [];
-  for (const item of list) {
-    const bucket = (passed.get(item.cc) || []).sort((a, b) => a.rtt - b.rtt).slice(0, PREMIUM_RACE);
-    if (!bucket.length) {
-      // 该地区一条都没判活：保留未验证候选，至少地区覆盖不塌（连接时会并发抢，全挂再回落）
-      out.push({ cc: item.cc, kind: item.kind, addrs: item.addrs.slice(0, PREMIUM_RACE), rtt: null });
-      continue;
-    }
-    out.push({ cc: item.cc, kind: item.kind, addrs: bucket.map((row) => row.addr), rtt: bucket[0].rtt });
+  for (const cc of PREMIUM_COUNTRIES) {
+    const bucket = (passed.get(cc) || []).sort((a, b) => a.rtt - b.rtt).slice(0, PREMIUM_RACE);
+    if (!bucket.length) continue;
+    const best = bucket[0];
+    out.push({
+      cc,
+      kind: 'http',
+      addrs: bucket.map((row) => row.addr),
+      rtt: best.rtt,
+      egressIp: best.egress ? best.egress.ip : '',
+      egressCity: best.egress ? best.egress.city : '',
+    });
   }
   return out;
+}
+
+/* --------------------------------------------------------------------------
+ * 自动高速（v1.0.8 新增）：生成配置时就地测「出站质量」，只把过关的中转 / 代理
+ * 单独放进「⚡ 自动高速」组。旧的「自动中转 / 自动直连 / 自动代理」机制一行没动。
+ *
+ * 三条判据：
+ *   1) 风险：ip-api 批量查入口 IP 的 proxy / hosting / as —— 机房 IP 比公开代理干净，
+ *      住宅 IP 最好（x.com、chatgpt 这类风控认的就是这几个字段）；
+ *   2) 延迟：Worker 到该 IP 的 TCP 握手耗时（socket.opened，不写业务数据）；
+ *   3) 带宽：经该 IP 起 TLS 打自己 Worker 的 /<密码>/hs/speed?bytes=N，
+ *      用「读到的字节 ÷ 用时」折算 Mbps（startTls 指定 SNI 才能跟 CF 边缘握手）。
+ *
+ * 结论永久存 isolate 内存（hsGood），每 HS_RETEST_MS 复测一次；复测变差就踢出，
+ * 踢掉的进 hsDead 冷却一阵再放回来重测。
+ * -------------------------------------------------------------------------- */
+const HS_NAME = '⚡ 自动高速';
+const HS_FIELDS = 'status,message,country,countryCode,region,regionName,city,isp,org,as,proxy,hosting,query';
+const HS_RELAY_SAMPLE = 24;     // 一次最多测多少条中转
+const HS_PROXY_SAMPLE = 12;     // 一次最多测多少条代理
+const HS_RACE = 5;              // 并发探测数（留 2 个连接额度给正常请求）
+const HS_TCP_TIMEOUT = 1200;
+const HS_TLS_TIMEOUT = 2600;
+const HS_TLS_BATCH = 8;         // 只对延迟最好的前 N 条测带宽
+const HS_READ_BUDGET = 900;     // 带宽取样窗口（ms）
+const HS_SPEED_BYTES = 262144;  // 取样上限 256 KB
+const HS_MIN_MBPS = 1.2;        // 低于这个不算「大带宽」
+const HS_MAX_RTT = 900;         // 高于这个不算「低延迟」
+const HS_MAX_RISK = 1;          // 中转：只接受机房 / 家宽（proxy=false）
+const HS_PROXY_MAX_RISK = 3;    // 代理：公开代理天然带 proxy=true，放宽到 3
+const HS_RETEST_MS = 2 * 60 * 60 * 1000;    // 高质节点 2 小时复测一次（旧 30 分钟太勤）
+const HS_DEAD_TTL = 10 * 60 * 1000;
+const HS_BUDGET = 5000;         // 后台补测的总预算，超了就用已测出来的
+const HS_COLD_BUDGET = 1200;    // 冷启动时同步等这么久（只在这个 isolate 第一次生成配置时发生）
+const HS_LIMIT = 80;
+const hsGood = new Map();       // key(种类|地址) -> { at, kind, addr, ip, port, cc, risk, rtt, mbps, isp, as, country, city }
+const hsDead = new Map();
+let hsTlsBroken = false;        // 运行时没有 startTls(选项) 时退化成「只看延迟 + 风险」
+let hsLastError = '';           // 最近一次带宽探测卡在哪一步（/hs 里会吐出来，纯调试用）
+let hsWarm = false;             // 这个 isolate 是否已经跑过一轮探测
+
+function hsRiskOf(meta) {
+  if (!meta || meta.status !== 'success') return 0;   // 查不到（多半是 ip-api 限流）不算风险，别把好 IP 误杀
+  let risk = 0;
+  if (meta.proxy === true) risk += 3;
+  if (meta.hosting === true) risk += 1;
+  return risk;
+}
+
+// 批量查风险（ip-api 批量接口：一次 100 个 IP，不烧单条配额）
+async function hsBatchMeta(ips) {
+  const out = new Map();
+  const list = Array.from(new Set((ips || []).filter((ip) => /^\d{1,3}(\.\d{1,3}){3}$/.test(String(ip || '')))));
+  for (let index = 0; index < list.length; index += 100) {
+    const chunk = list.slice(index, index + 100);
+    try {
+      const response = await fetch('http://ip-api.com/batch?fields=' + HS_FIELDS, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(chunk.map((ip) => ({ query: ip }))),
+      });
+      if (!response.ok) continue;
+      const rows = await response.json();
+      if (!Array.isArray(rows)) continue;
+      rows.forEach((row, i) => {
+        if (row && row.status === 'success' && chunk[i]) out.set(chunk[i], row);
+      });
+    } catch (error) {}
+  }
+  return out;
+}
+
+// TCP 握手耗时（只连不发，纯连通性 + 延迟）
+async function hsTcpRtt(host, port, ms = HS_TCP_TIMEOUT) {
+  const started = Date.now();
+  let socket = null;
+  try {
+    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), ms, 'TCP 握手');
+    return Date.now() - started;
+  } catch (error) {
+    return null;
+  } finally {
+    closeSocket(socket);
+  }
+}
+
+// 读一小段（带宽取样 / 读 CONNECT 应答），返回 { text(前 512 字节), bytes }
+async function hsReadSome(socket, budget, cap) {
+  const reader = socket.readable.getReader();
+  const started = Date.now();
+  let bytes = 0;
+  let text = '';
+  try {
+    while (bytes < cap && Date.now() - started < budget) {
+      const left = Math.max(1, budget - (Date.now() - started));
+      const raced = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), left)),
+      ]);
+      if (!raced || raced.timeout || raced.done || !raced.value) break;
+      const chunk = toBytes(raced.value);
+      if (!chunk.length) continue;
+      bytes += chunk.length;
+      if (text.length < 512) {
+        const room = 512 - text.length;
+        text += new TextDecoder().decode(chunk.subarray(0, Math.min(room, chunk.length)));
+      }
+    }
+  } catch (error) {
+  } finally {
+    try { reader.releaseLock(); } catch (error) {}
+  }
+  return { text, bytes };
+}
+
+// 经一个入口（中转 IP / HTTP 代理）跟自己的 Worker 建 TLS，量真实带宽
+async function hsTlsProbe(kind, host, port, hostName, trace = null) {
+  let socket = null;
+  let tls = null;
+  const steps = [];
+  const note = (text) => { steps.push(text); if (trace) trace.push(text); };
+  try {
+    note('connect ' + host + ':' + port);
+    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), HS_TCP_TIMEOUT, 'TCP 握手');
+    note('tcp ok');
+    if (kind === 'http') {
+      const connectReq = 'CONNECT ' + hostName + ':443 HTTP/1.1\r\nHost: ' + hostName + ':443\r\n\r\n';
+      await writeSocketTimed(socket, textEncoder.encode(connectReq), HS_TCP_TIMEOUT);
+      const head = await hsReadSome(socket, HS_TCP_TIMEOUT, 512);
+      if (!/^HTTP\/1\.[01] 200/.test(head.text)) { note('CONNECT 未回 200: ' + head.text.slice(0, 60)); return null; }
+      note('CONNECT 200');
+    }
+    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; note('没有 startTls'); return null; }
+    tls = socket.startTls({ expectedServerHostname: hostName });
+    note('startTls 已调用');
+    await withTimeout(tls.opened || Promise.resolve(), HS_TLS_TIMEOUT, 'TLS 握手');
+    note('tls ok');
+    const request = 'GET /' + PASSWORD + '/hs/speed?bytes=' + HS_SPEED_BYTES + ' HTTP/1.1\r\nHost: ' + hostName +
+      '\r\nUser-Agent: hs-probe\r\nAccept: */*\r\nConnection: close\r\n\r\n';
+    const started = Date.now();
+    await writeSocketTimed(tls, textEncoder.encode(request), HS_TLS_TIMEOUT);
+    note('请求已发出');
+    const stats = await hsReadSome(tls, HS_READ_BUDGET, HS_SPEED_BYTES);
+    const elapsed = Date.now() - started;
+    note('读到 ' + stats.bytes + 'B/' + elapsed + 'ms 头部 ' + JSON.stringify(stats.text.slice(0, 40)));
+    if (!/^HTTP\/1\.[01] 200/.test(stats.text)) return null;
+    if (elapsed <= 0 || stats.bytes < 4096) return null;
+    note('通过');
+    return { mbps: (stats.bytes * 8) / (elapsed / 1000) / 1e6, bytes: stats.bytes, ms: elapsed };
+  } catch (error) {
+    const msg = String((error && error.message) || error);
+    note('异常: ' + msg);
+    if (/starttls/i.test(msg)) hsTlsBroken = true;
+    return null;
+  } finally {
+    if (!trace && steps.length) hsLastError = steps.join(' > ');
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+// 中转的强证据（v1.0.9）：经它起 TLS 跟 CF 边缘握手，并要求 /cdn-cgi/trace 回 200。
+// 只测 TCP 握手的中转大量是「连得上但打不开」，这一步把它们挡在外面。
+async function probeRelayEvidence(ip, port, ms = HS_TLS_TIMEOUT) {
+  let socket = null;
+  let tls = null;
+  try {
+    socket = connect({ hostname: ip, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), HS_TCP_TIMEOUT, 'TCP 握手');
+    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; return null; }
+    tls = socket.startTls({ expectedServerHostname: 'www.cloudflare.com' });
+    await withTimeout(tls.opened || Promise.resolve(), ms, 'TLS 握手');
+    const request = 'GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nUser-Agent: relay-probe\r\nConnection: close\r\n\r\n';
+    await writeSocketTimed(tls, textEncoder.encode(request), ms);
+    const stats = await hsReadSome(tls, ms, 2048);
+    if (!/^HTTP\/1\.[01] 200/.test(stats.text)) return null;
+    if (!/colo=|fl=|h=www\.cloudflare\.com/i.test(stats.text)) return null;
+    return { bytes: stats.bytes };
+  } catch (error) {
+    return null;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+// 纯净中转的候选改用「中转机」：中转机是按 SNI 转发到 CF 边缘的透传，出口就是那台机器自己的 IP。
+// 做法：连它 → 用 www.cloudflare.com 做 SNI 完成 TLS → 读 /cdn-cgi/trace，出口不是 IPv4 就淘汰。
+async function probePureRelayIp(ip, port, ms = PURE_PROBE_TIMEOUT) {
+  let socket = null;
+  let tls = null;
+  const started = Date.now();
+  try {
+    socket = connect({ hostname: ip, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), HS_TCP_TIMEOUT, 'TCP 握手');
+    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; pureDebug.tlsBroken = true; return null; }
+    tls = socket.startTls({ expectedServerHostname: 'www.cloudflare.com' });
+    await withTimeout(tls.opened || Promise.resolve(), ms, 'TLS 握手');
+    const request = 'GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nUser-Agent: pure-probe\r\nConnection: close\r\n\r\n';
+    await writeSocketTimed(tls, textEncoder.encode(request), ms);
+    const stats = await hsReadSome(tls, ms, 2048);
+    pureDebug.lastHead = String(stats.text || '').slice(0, 48);
+    if (!/^HTTP\/1\.[01] 200/.test(stats.text)) { pureDebug.httpFail += 1; return null; }
+    const ipMatch = stats.text.match(/\nip=([^\r\n]+)/);
+    const locMatch = stats.text.match(/\nloc=([A-Za-z]{2})/);
+    const egress = ipMatch ? ipMatch[1].trim() : '';
+    if (!isIPv4(egress)) { pureDebug.ipv6 += 1; return null; }
+    pureDebug.ok += 1;
+    return { ip: egress, loc: locMatch ? locMatch[1].toUpperCase() : '', ms: Date.now() - started };
+  } catch (error) {
+    pureDebug.lastError = String((error && error.message) || error);
+    pureDebug.tlsFail += 1;
+    return null;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+function hsKeyOf(item) {
+  return item.kind + '|' + item.addr;
+}
+
+// 挑要测的候选：没测过的优先，其次该复测的，死了的先跳过
+function hsPick(list, count) {
+  const fresh = [];
+  const stale = [];
+  for (const item of list) {
+    if (!item || !item.ip) continue;
+    const key = hsKeyOf(item);
+    const deadAt = hsDead.get(key);
+    if (deadAt) {
+      if (Date.now() - deadAt < HS_DEAD_TTL) continue;
+      hsDead.delete(key);
+    }
+    const record = hsGood.get(key);
+    if (record && Date.now() - record.at < HS_RETEST_MS) continue;   // 还新鲜，不用重测
+    (record ? stale : fresh).push(item);
+  }
+  const shuffle = (arr) => {
+    for (let i = arr.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  };
+  return shuffle(fresh).concat(shuffle(stale)).slice(0, count);
+}
+
+// 探一批候选：风险（ip-api 批量）→ 延迟（TCP）→ 带宽（TLS 打自己）
+async function hsProbe(list, hostName, deadline) {
+  if (!list.length) return;
+  const meta = await hsBatchMeta(list.map((item) => item.ip));
+  const usable = [];
+  for (const item of list) {
+    const info = meta.get(item.ip) || null;
+    const risk = hsRiskOf(info);
+    const riskLimit = item.kind === 'http' ? HS_PROXY_MAX_RISK : HS_MAX_RISK;
+    if (risk > riskLimit) {
+      hsDead.set(hsKeyOf(item), Date.now());
+      continue;
+    }
+    usable.push({ ...item, risk, info });
+  }
+  const alive = [];
+  for (let index = 0; index < usable.length; index += HS_RACE) {
+    if (Date.now() > deadline) break;
+    const batch = usable.slice(index, index + HS_RACE);
+    const settled = await Promise.all(batch.map(async (item) => ({ item, rtt: await hsTcpRtt(item.ip, item.port) })));
+    for (const row of settled) {
+      if (row.rtt == null || row.rtt > HS_MAX_RTT) continue;
+      alive.push({ ...row.item, rtt: row.rtt, mbps: null });
+    }
+  }
+  alive.sort((a, b) => a.rtt - b.rtt);
+  // 中转先过「强证据」：能摸到 CF 边缘才算出口，摸不到的踢进冷却
+  const relayTargets = hsTlsBroken ? [] : alive.filter((item) => item.kind === 'relay').slice(0, HS_TLS_BATCH);
+  for (let index = 0; index < relayTargets.length; index += 2) {
+    if (Date.now() > deadline) break;
+    const batch = relayTargets.slice(index, index + 2);
+    const settled = await Promise.all(batch.map(async (item) => ({ item, ok: Boolean(await probeRelayEvidence(item.ip, item.port)) })));
+    for (const row of settled) {
+      // 只把「测过且失败」的踢掉：预算用完没测到的保留（按延迟排后面），否则冷启动会一个节点都不剩
+      if (row.ok) row.item.evidence = true; else row.item.evidenceFailed = true;
+    }
+  }
+  const verified = alive.filter((item) => item.kind !== 'relay' || item.evidence === true || item.evidenceFailed !== true);
+  // 带宽只测最快的那几条代理（每条要起 TLS，贵）
+  const tlsTargets = hsTlsBroken ? [] : verified.filter((item) => item.kind === 'http').slice(0, HS_TLS_BATCH);
+  const probeTls = async (item) => {
+    const result = await hsTlsProbe(item.kind, item.ip, item.port, hostName);
+    if (result) {
+      item.mbps = result.mbps;
+      item.bytes = result.bytes;
+    }
+  };
+  for (let index = 0; index < tlsTargets.length; index += 2) {
+    if (Date.now() > deadline) break;
+    await Promise.all(tlsTargets.slice(index, index + 2).map(probeTls));
+  }
+  // 落库：带宽测到的按带宽排，没测到的（TLS 不可用 / 超时）只要延迟低也留着
+  for (const item of verified) {
+    const key = hsKeyOf(item);
+    const info = item.info || {};
+    const ok = item.mbps == null ? item.rtt <= HS_MAX_RTT : item.mbps >= HS_MIN_MBPS;
+    if (!ok) { hsDead.set(key, Date.now()); continue; }
+    hsGood.set(key, {
+      at: Date.now(),
+      kind: item.kind,
+      addr: item.addr,
+      ip: item.ip,
+      port: item.port,
+      cc: item.cc || '',
+      risk: item.risk,
+      rtt: item.rtt,
+      mbps: item.mbps == null ? null : Number(item.mbps.toFixed(1)),
+      country: String(info.countryCode || item.cc || '').toUpperCase(),
+      city: String(info.city || ''),
+      isp: String(info.isp || ''),
+      as: String(info.as || ''),
+    });
+  }
+}
+
+// 把 hsGood 里的高质 IP 变成节点（中转 + 代理都有）
+async function buildHighSpeedNodes(hostName, premiumPool, ctx) {
+  let relayItems = [];
+  try { relayItems = await loadRelayList(); } catch (error) { relayItems = []; }
+  const relayPool = (relayItems || [])
+    .filter((item) => item.port === 443 && item.ip)
+    .map((item) => ({ kind: 'relay', addr: item.ip + ':443', ip: item.ip, port: 443, cc: item.cc }));
+  const relays = hsPick(relayPool, HS_RELAY_SAMPLE);
+
+  // 面板也会走 buildContext，但它不需要等探测结果（ctx 为空就是面板在渲染）
+  const cold = !hsWarm && ctx ? HS_COLD_BUDGET : 0;
+  hsWarm = true;
+  // 中转先测：这段时间正好和「代理池抓取」并行跑，省一次串行等待
+  if (relays.length && cold) {
+    try { await hsProbe(relays, hostName, Date.now() + cold); } catch (error) {}
+  }
+
+  // 代理池可能还在飞：一律不等。HS 组先用已有记录出节点，代理候选在响应之后自己排队测
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    const rest = relays.filter((item) => !hsGood.has(hsKeyOf(item)) && !hsDead.has(hsKeyOf(item)));
+    if (rest.length) ctx.waitUntil(hsProbe(rest.slice(0, 40), hostName, Date.now() + 20000).catch(() => {}));
+    ctx.waitUntil((async () => {
+      let pool = premiumPool;
+      if (pool && typeof pool.then === 'function') {
+        try { pool = await pool; } catch (error) { pool = null; }
+      }
+      const proxyPool = [];
+      for (const item of pool || []) {
+        const addr = (item.addrs || [])[0];
+        if (!addr) continue;
+        const colon = addr.lastIndexOf(':');
+        if (colon <= 0) continue;
+        proxyPool.push({ kind: 'http', addr, ip: addr.slice(0, colon), port: Number(addr.slice(colon + 1)), cc: item.cc });
+      }
+      const proxies = hsPick(proxyPool, HS_PROXY_SAMPLE).filter((item) => !hsGood.has(hsKeyOf(item)) && !hsDead.has(hsKeyOf(item)));
+      if (proxies.length) await hsProbe(proxies, hostName, Date.now() + 15000);
+    })().catch(() => {}));
+  }
+  const records = Array.from(hsGood.values())
+    .filter((record) => record && record.ip)
+    .sort((a, b) => {
+      const bandwidth = (b.mbps || 0) - (a.mbps || 0);
+      if (Math.abs(bandwidth) > 0.01) return bandwidth;
+      return a.rtt - b.rtt;
+    })
+    .slice(0, HS_LIMIT);
+
+  const nodes = [];
+  for (const record of records) {
+    const code = String(record.country || record.cc || '').toUpperCase();
+    const region = REGION_NAMES[code] || code || '未知';
+    const flag = countryFlag(code);
+    const label = (record.kind === 'relay' ? '高速-中转-' : '高速-代理-') + region;
+    // 客户端不显示实测数值（m05901）：名字里只留地区，质量差异交给 url-test 自己测
+    const metric = '';
+    const name = flag + ' ' + label + ' ' + (nodes.length + 1) + metric;
+    if (record.kind === 'relay') {
+      nodes.push({
+        name,
+        server: record.ip,
+        port: record.port,
+        uuid: userID,
+        host: hostName,
+        path: WS_PATH + '&mode=relay' + (record.cc ? '&rg=' + record.cc : ''),
+        tls: true,
+        region: '自动高速',
+        flag,
+        country: code,
+        city: record.city || '',
+        speed: 0,
+        latency: record.rtt,
+        score: 0,
+        group: 'fast',
+        relayNode: true,
+        relayRegion: record.cc || '',
+        fastNode: true,
+        fastKind: 'relay',
+      });
+    } else {
+      nodes.push({
+        name,
+        server: hostName,
+        port: 443,
+        uuid: userID,
+        host: hostName,
+        path: WS_PATH + '&mode=proxy&px=' + encodeURIComponent('http|' + record.addr),
+        tls: true,
+        region: '自动高速',
+        flag,
+        country: code,
+        city: record.city || '',
+        speed: 0,
+        latency: record.rtt,
+        score: 0,
+        group: 'fast',
+        fastNode: true,
+        fastKind: 'proxy',
+      });
+    }
+  }
+  return nodes;
+}
+
+// 调试视图：看看这个 isolate 记住了哪些高质 IP、带宽多少
+function handleHighSpeedStatus() {
+  const rows = Array.from(hsGood.values())
+    .sort((a, b) => (b.mbps || 0) - (a.mbps || 0) || a.rtt - b.rtt)
+    .map((record) => ({
+      kind: record.kind,
+      addr: record.addr,
+      country: record.country,
+      city: record.city,
+      isp: record.isp,
+      as: record.as,
+      risk: record.risk,
+      rtt: record.rtt,
+      mbps: record.mbps,
+      ageSec: Math.round((Date.now() - record.at) / 1000),
+    }));
+  return new Response(JSON.stringify({
+    pageVersion: PAGE_VERSION,
+    group: HS_NAME,
+    tlsProbe: hsTlsBroken ? 'startTls 不可用，只按延迟+风险判定' : '可用',
+    lastError: hsLastError,
+    good: rows.length,
+    dead: hsDead.size,
+    rows,
+  }, null, 2), {
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  });
 }
 
 // 带独立超时的抓取（订阅生成路径上用，绝不能等满 SOURCE_TIMEOUT）
@@ -782,12 +1650,26 @@ async function fetchPremiumPool() {
   if (premiumCache.list.length && Date.now() - premiumCache.at < PREMIUM_TTL) return premiumCache.list;
   // 免费代理池里 proxifly 那批活不到 5%，改成从已经在用的 monosans 池抽样，再批量反查国家
   let sample = [];
+  const tPool = Date.now();
   try {
     const pool = await loadHttpProxies();
+    premiumDebug.pool = Array.isArray(pool) ? pool.length : 0;
     if (Array.isArray(pool) && pool.length) sample = pickProxies(pool, PREMIUM_SAMPLE);
-  } catch (error) { sample = []; }
+    premiumDebug.sampled = sample.length;
+  } catch (error) {
+    premiumDebug.poolError = (error && error.message) || String(error);
+    sample = [];
+  }
+  premiumDebug.poolMs = Date.now() - tPool;
   if (!sample.length) return premiumCache.list || [];
-  const geo = await geoLookupCountries(sample);
+  const tGeo = Date.now();
+  let geo = new Map();
+  try {
+    geo = await geoLookupCountries(sample);
+  } catch (error) {
+    premiumDebug.geoError = (error && error.message) || String(error);
+  }
+  premiumDebug.geo = { total: sample.length, hits: geo.size, ms: Date.now() - tGeo };
   const byCountry = new Map();
   for (const addr of sample) {
     const cc = geo.get(addr);
@@ -802,11 +1684,56 @@ async function fetchPremiumPool() {
     const bucket = byCountry.get(cc);
     if (bucket && bucket.length) candidates.push({ cc, kind: 'http', addrs: bucket, rtt: null });
   }
+  premiumDebug.candidates = candidates.length;
   if (!candidates.length) return premiumCache.list || [];
-  let verified = [];
-  try { verified = await verifyPremiumPool(candidates); } catch (error) { verified = []; }
-  // 判活几乎全挂时退回未验证的，至少订阅结构不塌
-  const list = (verified.length ? verified : candidates).slice(0, PREMIUM_LIMIT);
+  // 两段式：先按「代理注册地」立刻出一份名单（抓池 30ms + 反查国家 45ms），
+  // 真实判活放到后台做（一批 5 秒起步），测过的地址下次生成时自然排到前面。
+  // 这样冷启动不会为了等判活把订阅生成拖到十几秒。
+  let list = [];
+  {
+    const usedAddr = new Set();
+    for (const cc of PREMIUM_COUNTRIES) {
+      if (list.length >= PREMIUM_LIMIT) break;
+      const pick = candidates.find((item) => item.cc === cc && (item.addrs || []).some((addr) => !usedAddr.has(addr)));
+      if (!pick) continue;
+      const addrs = pick.addrs.filter((addr) => !usedAddr.has(addr)).slice(0, PREMIUM_RACE);
+      for (const addr of addrs) usedAddr.add(addr);
+      const hit = premiumProbeCache.get(addrs[0]);
+      list.push({ cc, kind: 'http', addrs, rtt: hit ? hit.rtt : null, verified: Boolean(hit), egressIp: hit ? hit.ip : '', egressCity: '' });
+    }
+  }
+  premiumCache = { list, at: Date.now() };
+  // 后台判活：一次只跑一份，结果写回缓存，下一次请求就能用上「真实出口」标签
+  if (!premiumVerifying) {
+    premiumVerifying = true;
+    verifyPremiumPool(candidates).then((rows) => {
+      if (!rows || !rows.length) return;
+      const merged = rows.slice(0, PREMIUM_LIMIT);
+      const have = new Set(merged.map((item) => item.cc));
+      for (const item of list) {
+        if (merged.length >= PREMIUM_LIMIT) break;
+        if (have.has(item.cc)) continue;
+        merged.push(item);
+        have.add(item.cc);
+      }
+      premiumCache = { list: merged, at: Date.now() };
+    }).catch((error) => {
+      premiumDebug.verifyError = (error && error.message) || String(error);
+    }).finally(() => { premiumVerifying = false; });
+  }
+  // 还不够就按注册地一条条补（不挑地区，只求每个目标国家都有节点）
+  if (list.length < PREMIUM_LIMIT) {
+    const usedAddr = new Set(list.flatMap((item) => item.addrs || []));
+    for (const cc of PREMIUM_COUNTRIES) {
+      if (list.length >= PREMIUM_LIMIT) break;
+      const pick = candidates.find((item) => item.cc === cc && (item.addrs || []).some((addr) => !usedAddr.has(addr)));
+      if (!pick) continue;
+      const addr = pick.addrs.find((row) => !usedAddr.has(row));
+      usedAddr.add(addr);
+      list.push({ cc, kind: 'http', addrs: [addr], rtt: null, verified: false, egressIp: '', egressCity: '' });
+    }
+  }
+  // 连出口都测不出来时宁可不生成（旧版在这里拿「代理注册地」凑数，地区就会对不上）
   premiumCache = { list, at: Date.now() };
   return list;
 }
@@ -858,16 +1785,24 @@ function parsePinnedProxy(value) {
 }
 
 async function fetchProxyList(sources) {
+  // 并行抓、每个源各自限时：旧版是串行 + 全局 12 秒超时，
+  // 一个源卡住就把后面的全拖死，冷启动光抓池子就能耗掉 6 秒。
   const seen = new Set();
-  for (const source of sources) {
-    try {
-      const text = await fetchText(source);
-      const lines = String(text).split(/\r?\n/).filter((line) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(line.trim()));
-      for (const line of lines.slice(0, 400)) seen.add(line.trim());
-      if (seen.size >= 40) break;
-    } catch (error) {}
+  const settled = await Promise.allSettled(
+    sources.map(async (source) => {
+      const text = await fetchTextTimed(source, PROXY_SOURCE_TIMEOUT);
+      return String(text)
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(line));
+    })
+  );
+  for (const result of settled) {
+    if (result.status !== 'fulfilled' || !Array.isArray(result.value)) continue;
+    for (const line of result.value.slice(0, 600)) seen.add(line);
+    if (seen.size >= 1600) break;
   }
-  return [...seen].slice(0, 400);
+  return [...seen].slice(0, 1600);
 }
 
 // proxies.json 里带地区/城市/ASN/timeout，可按地区筛选；文件约 1MB，只解析一次并缓存
@@ -909,8 +1844,10 @@ async function loadHttpProxies() {
   }
   // 注：proxies.json 带地区/城市，但约 1MB，Worker 里解析+传输会超时（实测请求直接 504/EOF），
   // 所以运行时仍用轻量的 txt 列表（http 18KB / socks5 3KB）。
-  const http = await fetchProxyList(HTTP_PROXY_SOURCES);
-  const socks = await fetchProxyList(SOCKS5_PROXY_SOURCES);
+  const [http, socks] = await Promise.all([
+    fetchProxyList(HTTP_PROXY_SOURCES),
+    fetchProxyList(SOCKS5_PROXY_SOURCES),
+  ]);
   httpProxyCache = { list: http, socks, at: Date.now(), geo: false };
   return http;
 }
@@ -999,6 +1936,21 @@ async function connectViaSocks5Proxy(proxy, targetHost, targetPort, payload, tim
 }
 
 // 并发竞争：谁先 CONNECT 成功就用谁；成功的那个记住，下次先试
+// 只从「指定地址」里抢（纯净中转用：这些地址的出口已经验过是 IPv4）
+async function raceProxiesFrom(addrs, targetHost, targetPort, payload, ms = 3000) {
+  const list = (addrs || []).filter((addr) => typeof addr === 'string' && /^[^\s|,:]+:\d{1,5}$/.test(addr));
+  if (!list.length) return null;
+  const attempts = list.map((addr) => connectViaHttpProxy(addr, targetHost, targetPort, payload, ms)
+    .then((socket) => ({ socket, proxy: addr })));
+  try {
+    const winner = await Promise.any(attempts);
+    try { winner.socket.__proxyAddr = winner.proxy; } catch (error) { /* 只读对象就算了 */ }
+    return winner.socket;
+  } catch (error) {
+    return null;
+  }
+}
+
 async function raceProxies(targetHost, targetPort, payload, count = 8) {
   const list = await loadHttpProxies();
   if (!list.length) throw new Error('代理列表为空');
@@ -1194,22 +2146,288 @@ async function openTarget(address, port, payload, forceRelay = false, pinnedProx
   }
 }
 
-// 死中转的记忆（10 分钟内不再尝试，直接走池子）
+/* ------------------------------------------------------------------
+ * 中转健康账本（v1.0.9）：阶梯冷却 + 只降权不排除 + 归因 + 缓存
+ *   - 失败 1/2/3/4 次 → 10s/60s/3min/5min，成功立刻清零（旧版固定压 10 分钟）
+ *   - 冷却中的中转只是排到队尾；整池都在冷却时挑「最快恢复」的那条再试一次
+ *   - 归因：只有连接期失败才记账；客户端断开 / 额度耗尽 / 超时取消不算节点问题
+ *   - 缓存：连通的 rtt 记 30 分钟，下次直接排前面，不用重测
+ * ------------------------------------------------------------------ */
+const RELAY_COOLDOWN = [10 * 1000, 60 * 1000, 3 * 60 * 1000, 5 * 60 * 1000];
+const RELAY_OK_TTL = 2 * 60 * 60 * 1000;     // 中转测好的延迟记 2 小时
+const RELAY_EXPLORE = 0.05;      // 5% 的请求故意换一条没测过的，防止误判把节点永久压死
+const RELAY_RACE = 2;            // 两条一组并发抢（串行 1.5 秒一条，一个区三条就要 4.5 秒）
+const RELAY_TRY_TIMEOUT = 2200;
 const relaySticky = new Map();
-const relayDead = new Map();
-function isRelayDead(key) {
-  const at = relayDead.get(key);
-  if (!at) return false;
-  if (Date.now() - at > 10 * 60 * 1000) { relayDead.delete(key); return false; }
-  return true;
+const relayHealth = new Map();
+const relayStats = { ok: 0, fail: 0, raced: 0, explore: 0, leastBad: 0, fallback: 0 };
+let relayLastError = '';
+
+function relayUpAt(key) {
+  const record = relayHealth.get(key);
+  if (!record || !record.until) return 0;
+  return record.until > Date.now() ? record.until : 0;
 }
-function markRelayDead(key) {
-  if (relayDead.size > 500) relayDead.clear();
-  relayDead.set(key, Date.now());
+// 名字保留（/diag 与旧代码在用），语义变成「还在冷却」
+function isRelayDead(key) { return relayUpAt(key) > 0; }
+function noteRelayOk(key, rtt) {
+  relayStats.ok += 1;
+  relayHealth.set(key, { fails: 0, until: 0, okAt: Date.now(), rtt: Number.isFinite(rtt) ? rtt : null });
+}
+function noteRelayFail(key) {
+  relayStats.fail += 1;
+  if (relayHealth.size > 600) relayHealth.clear();
+  const record = relayHealth.get(key) || { fails: 0, until: 0, okAt: 0, rtt: null };
+  record.fails += 1;
+  record.until = Date.now() + RELAY_COOLDOWN[Math.min(record.fails - 1, RELAY_COOLDOWN.length - 1)];
+  relayHealth.set(key, record);
+}
+// 归因三态：这些错误不是中转的错，别写进账本
+function isNotRelayFault(message) {
+  return /too many|BudgetExhausted|额度|client|aborted|WebSocket|closed pipe|握手超时/i.test(String(message || ''));
+}
+// 越小越好：冷却中的排最后（越早恢复越靠前），没测过的中性，测得快且新鲜的排最前
+// 出口质量：中转机「能握手」不代表「能传数据」——实测一半以上是握手秒回、传几 KB 就断。
+// 这里用自己 Worker 的 /hs/speed 传 256KB 实测量，带宽和首字节都记下来。
+const relayQuality = new Map();
+const RELAY_QUALITY_TTL = 2 * 60 * 60 * 1000;
+const RELAY_SPEED_BYTES = 262144;
+const RELAY_SPEED_MIN = 0.15;   // Mbps，低于这个就算「传不动」
+let relayQualityBusy = false;
+let runtimeHost = '';   // 当前请求的域名，出口测速要拿它当 SNI 回来打自己的 /hs/speed
+
+async function probeRelayQuality(item, hostName, ms = 7000) {
+  if (!item || !item.ip) return null;
+  let socket = null;
+  let tls = null;
+  const started = Date.now();
+  const trace = [];
+  const note = (text) => { trace.push(Date.now() - started + 'ms ' + text); };
+  const speedHost = 'speed.cloudflare.com';
+  try {
+    socket = connect({ hostname: item.ip, port: item.port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), 2500, 'TCP');
+    note('tcp ok');
+    if (typeof socket.startTls !== 'function') { note('no startTls'); return null; }
+    tls = socket.startTls({ expectedServerHostname: speedHost });
+    await withTimeout(tls.opened || Promise.resolve(), ms, 'TLS');
+    const tlsAt = Date.now();
+    note('tls ok');
+    const request = 'GET /__down?bytes=' + RELAY_SPEED_BYTES + ' HTTP/1.1\r\nHost: ' + speedHost +
+      '\r\nUser-Agent: curl/8.0\r\nAccept: */*\r\nConnection: close\r\n\r\n';
+    await writeSocketTimed(tls, textEncoder.encode(request), 2500);
+    note('sent ' + request.length + 'B');
+    const reader = tls.readable.getReader();
+    let bytes = 0;
+    let firstAt = 0;
+    let head = '';
+    const deadline = started + ms;
+    try {
+      while (Date.now() < deadline) {
+        const wait = Math.max(250, deadline - Date.now());
+        const raced = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => setTimeout(() => resolve(null), wait)),
+        ]);
+        if (!raced) { note('read timeout, bytes=' + bytes); break; }
+        if (raced.done) { note('read done, bytes=' + bytes); break; }
+        if (!raced.value) continue;
+        const chunk = toBytes(raced.value);
+        if (!firstAt) { firstAt = Date.now(); head = String.fromCharCode.apply(null, Array.from(chunk.slice(0, 60))); note('first chunk ' + chunk.length + 'B'); }
+        bytes += chunk.length;
+        if (bytes >= RELAY_SPEED_BYTES) break;
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (error) {}
+    }
+    const body = Math.max(0, bytes - 200);
+    const span = Math.max(300, Date.now() - (firstAt || started));
+    const mbps = body > 0 ? (body * 8) / 1e6 / (span / 1000) : 0;
+    const record = { mbps: Math.round(mbps * 100) / 100, rtt: tlsAt - started, at: Date.now(), got: bytes, trace, head: head.replace(/[\r\n]/g, '|') };
+    relayQuality.set(item.key, record);
+    if (mbps < RELAY_SPEED_MIN) markRelayFail(item.key);
+    else noteRelayOk(item.key, record.rtt);
+    return record;
+  } catch (error) {
+    note('ERR ' + ((error && error.message) || String(error)));
+    relayQuality.set(item.key, { mbps: 0, rtt: 0, at: Date.now(), got: 0, trace, error: (error && error.message) || String(error) });
+    return null;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+
+// 后台补测：每次只测几条，串行，避免撞连接数上限
+function kickRelayQuality(hostName, count = 5) {
+  const waiter = runtimeCtx;
+  if (relayQualityBusy || !waiter || typeof waiter.waitUntil !== 'function' || !hostName) return;
+  const now = Date.now();
+  const cands = relayPool443().filter((item) => {
+    const record = relayQuality.get(item.key);
+    if (record && now - record.at < RELAY_QUALITY_TTL) return false;
+    return !isRelayDead(item.key);
+  }).slice(0, count);
+  if (!cands.length) return;
+  relayQualityBusy = true;
+  waiter.waitUntil((async () => {
+    try {
+      for (const item of cands) await probeRelayQuality(item, hostName);
+    } finally {
+      relayQualityBusy = false;
+    }
+  })());
+}
+
+// 综合分：健康账本 + 实测传输耗时（256KB 要多久传完），越小越好
+function relayScoreOf(key) {
+  const base = relayCostOf(key);
+  const record = relayQuality.get(key);
+  if (record && Date.now() - record.at < RELAY_QUALITY_TTL) {
+    if (!record.mbps) return base + 6000;                                   // 传不动：排到最后
+    const transferMs = (RELAY_SPEED_BYTES * 8) / (record.mbps * 1e6) * 1000;
+    return base + Math.min(20000, transferMs) * 0.6;
+  }
+  return base + 1200;                                                       // 没测过：比测过的好机器靠后
+}
+
+function relayCostOf(key) {
+  const upAt = relayUpAt(key);
+  if (upAt) return 1e6 + (upAt - Date.now());
+  const record = relayHealth.get(key);
+  if (!record) return 800;
+  const fresh = record.okAt && Date.now() - record.okAt < RELAY_OK_TTL;
+  const rtt = record.rtt == null ? 800 : record.rtt;
+  return rtt + record.fails * 2000 - (fresh ? 200 : 0);
+}
+// 只用 IPv4：列表本身就是 IPv4，这里再兜一层，避免 IPv6 出口被站点风控直接 403
+// 用 x.com 的 trace 验一台机器：TLS 到机器但 SNI 写 x.com（中转机按 SNI 转给 CF 边缘），
+// 拿到的 ip= 就是 x.com 看到的出口。带冒号 = IPv6 出站 → 直接淘汰（推特会 403）
+async function probePureRelay(item, ms = PURE_PROBE_TIMEOUT) {
+  const started = Date.now();
+  const addr = String((item && item.addr) || '');
+  const colon = addr.lastIndexOf(':');
+  if (colon <= 0) return null;
+  const host = addr.slice(0, colon);
+  const port = Number(addr.slice(colon + 1));
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  let socket = null;
+  let tls = null;
+  try {
+    // 只用 x.com/cdn-cgi/trace 一条硬门槛：CONNECT 通 → TLS 握手 → trace 200 且 ip 是 IPv4
+    // 这样「能上推」是证据，不是推测；IPv6 出站会被直接淘汰
+    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
+    await withTimeout(socket.opened || Promise.resolve(), ms, 'TCP 握手');
+    if (typeof socket.startTls !== 'function') { pureDebug.lastError = '运行时无 startTls'; return null; }
+    await writeSocketTimed(socket, textEncoder.encode('CONNECT ' + PURE_TARGET_HOST + ':443 HTTP/1.1\r\nHost: ' + PURE_TARGET_HOST + ':443\r\n\r\n'), ms);
+    const conn = await hsReadSome(socket, Math.max(900, Math.round(ms / 2)), 256);
+    pureDebug.lastHead = (conn.text || '').slice(0, 60);
+    if (!/^HTTP\/1\.[01] 200/.test(conn.text || '')) { pureDebug.httpFail += 1; return null; }
+    tls = socket.startTls({ expectedServerHostname: PURE_TARGET_HOST });
+    await withTimeout(tls.opened || Promise.resolve(), ms, 'TLS 握手');
+    await writeSocketTimed(tls, textEncoder.encode('GET /cdn-cgi/trace HTTP/1.1\r\nHost: ' + PURE_TARGET_HOST + '\r\nUser-Agent: curl/8\r\nConnection: close\r\n\r\n'), ms);
+    const trace = await hsReadSome(tls, Math.max(900, Math.round(ms - (Date.now() - started))), 1536);
+    const text = trace.text || '';
+    if (!/^HTTP\/1\.[01] 200/.test(text)) { pureDebug.tlsFail += 1; return null; }
+    const ip = (/(?:^|\n)ip=([0-9a-fA-F:.]+)/.exec(text) || [])[1] || '';
+    if (!ip) { pureDebug.tlsFail += 1; return null; }
+    if (!isIPv4(ip)) { pureDebug.ipv6 += 1; return null; }   // IPv6 出站：x.com 直接 403
+    const loc = ((/(?:^|\n)loc=([A-Za-z]{2})/.exec(text) || [])[1] || '').toUpperCase();
+    pureDebug.ok += 1;
+    return { ip, loc, city: '', reliable: true, ms: Date.now() - started };
+  } catch (error) {
+    pureDebug.lastError = (error && error.message) || String(error);
+    return null;
+  } finally {
+    closeSocket(tls);
+    closeSocket(socket);
+  }
+}
+async function loadAltRelay(code) {
+  const cc = String(code || '').toUpperCase();
+  if (!cc) return [];
+  const hit = relayAltCache.get(cc);
+  if (hit && Date.now() - hit.at < RELAY_ALT_TTL) return hit.items;
+  let items = [];
+  let fetched = false;
+  for (const url of RELAY_ALT_SOURCES(cc)) {
+    try {
+      const text = await fetchTextTimed(url, 2500);
+      fetched = true;
+      const seen = new Set();
+      for (const line of String(text || '').split(/\r?\n/)) {
+        const match = line.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})(?:#|$)/);
+        if (!match) continue;
+        const port = Number(match[2]);
+        if (!port || port > 65535) continue;
+        const key = match[1] + ':' + port;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({ key, ip: match[1], port, cc });
+      }
+      break;
+    } catch (error) {}
+  }
+  if (!fetched) items = [];
+  items = items.slice(0, 20);
+  relayAltCache.set(cc, { at: Date.now(), items });
+  return items;
+}
+
+// 内置的「另一个中转池」：在线池里没有该地区时用它兜底（RELAY_FALLBACK 自带 ip:port:CC）
+function fallbackRelays(code) {
+  const seen = new Set();
+  const out = [];
+  for (const entry of RELAY_FALLBACK) {
+    const parts = String(entry).split(':');
+    if (parts.length < 3) continue;
+    const port = Number(parts[1]);
+    const cc = String(parts[2] || '').toUpperCase();
+    if (!port) continue;
+    if (code && cc !== code) continue;
+    const key = parts[0] + ':' + port;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, ip: parts[0], port, cc });
+  }
+  return out;
+}
+
+function relayPool443() {
+  const items = (relayListCache.items || []).filter((item) => item.port === 443 && /^\d{1,3}(\.\d{1,3}){3}$/.test(item.ip));
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = item.ip + ':' + item.port;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ key, ip: item.ip, port: item.port, cc: item.cc || '' });
+  }
+  return out;
+}
+// 两条一起抢：谁先拿到首字节谁上，另一条立刻关掉
+async function raceRelays(items, payload, ms) {
+  if (!items.length) return null;
+  relayStats.raced += 1;
+  const started = Date.now();
+  const attempts = items.map((item) => pinnedConnect({ hostname: item.ip, port: item.port }, payload, ms)
+    .then((socket) => { if (!socket) throw new Error('dead'); return { socket, item }; }));
+  try {
+    const winner = await Promise.any(attempts);
+    noteRelayOk(winner.item.key, winner.socket.__rtt || Date.now() - started);
+    attempts.forEach((pending) => pending.then((row) => {
+      if (row.item.key !== winner.item.key) closeSocket(row.socket);
+    }).catch(() => {}));
+    return winner;
+  } catch (error) {
+    if (!isNotRelayFault(relayLastError)) for (const item of items) noteRelayFail(item.key);
+    return null;
+  }
 }
 
 // 连上指定中转，写完 payload 后等首字节：拿到才算活着（connect 本身是惰性的，判断不了死活）
-async function pinnedConnect(pinned, payload, ms = 1500) {
+async function pinnedConnect(pinned, payload, ms = RELAY_TRY_TIMEOUT) {
+  const started = Date.now();
   let socket = null;
   try {
     socket = await connectWithTimeout(pinned, ms);
@@ -1225,10 +2443,12 @@ async function pinnedConnect(pinned, payload, ms = 1500) {
     } finally {
       try { reader.releaseLock(); } catch (error) {}
     }
-    if (!first || !first.length) { closeSocket(socket); return null; }
+    if (!first || !first.length) { relayLastError = '首字节超时'; closeSocket(socket); return null; }
     socket.__first = first;
+    socket.__rtt = Date.now() - started;
     return socket;
   } catch (error) {
+    relayLastError = String((error && error.message) || error);
     closeSocket(socket);
     return null;
   }
@@ -1247,29 +2467,45 @@ async function openTargetInner(address, port, payload, forceRelay = false, pinne
   };
 
   const tryRelayRegion = async (code) => {
-    const stickyKey = relaySticky.get(code);
-    if (stickyKey && !isRelayDead(stickyKey)) {
-      const parsed = parseProxyip(stickyKey);
-      if (parsed) {
-        const socket = await pinnedConnect(parsed, payload, 1500);
-        if (socket) return socket;
-        markRelayDead(stickyKey);
-        relaySticky.delete(code);
+    const slot = code || '*';
+    let pool = relayPool443();
+    if (code && !pool.some((item) => item.cc === code)) {
+      // 主仓库没有这个地区 → 用第二个仓库补（按国家分目录，IPv4 优质档）
+      const alt = await loadAltRelay(code);
+      if (alt.length) pool = pool.concat(alt);
+    }
+    if (!pool.length) return null;
+    kickRelayQuality(runtimeHost, 3);   // 顺手在后台补测几条出口带宽
+    // v1.0.8：指定了地区就只能用本区的机器。旧版不够 2 条就退化成全池，
+    // 于是「中转-日本」实际连到哈萨克斯坦——这就是地区对不上的根因
+    const same = code ? pool.filter((item) => item.cc === code) : [];
+    if (code && !same.length) { relayLastError = '该地区暂无可用中转'; return null; }
+    const base = code ? same : pool;
+    const queue = [];
+    const push = (item) => { if (item && !queue.some((row) => row.key === item.key)) queue.push(item); };
+    const stickyKey = relaySticky.get(slot);
+    if (stickyKey && !isRelayDead(stickyKey)) push(pool.find((item) => item.key === stickyKey));
+    // 5% 探索：故意抽一条没测过的，避免「降权 → 没样本 → 永远回不来」的死锁
+    if (Math.random() < RELAY_EXPLORE) {
+      const untested = pool.filter((item) => !relayHealth.has(item.key));
+      if (untested.length) { relayStats.explore += 1; push(untested[Math.floor(Math.random() * untested.length)]); }
+    }
+    for (const item of base.slice().sort((a, b) => relayScoreOf(a.key) - relayScoreOf(b.key))) push(item);
+    const deadline = Date.now() + 6000;   // 外层总超时 8 秒，这里给中转留 6 秒
+    for (let index = 0; index < queue.length; index += RELAY_RACE) {
+      if (Date.now() > deadline) break;
+      const winner = await raceRelays(queue.slice(index, index + RELAY_RACE), payload, RELAY_TRY_TIMEOUT);
+      if (winner) {
+        relaySticky.set(slot, winner.item.key);
+        return winner.socket;
       }
     }
-    const items = (relayListCache.items || []);
-    const candidates = code
-      ? items.filter((item) => item.cc === code && (item.port === 443 || item.cc === 'CN')).slice(0, RELAY_PER_REGION)
-      : items.filter((item) => item.port === 443).slice(0, 6);
-    for (const item of candidates) {
-      const key = item.ip + ':' + item.port;
-      if (isRelayDead(key)) continue;
-      const socket = await pinnedConnect({ hostname: item.ip, port: item.port }, payload, 1500);
-      if (socket) {
-        relaySticky.set(code || item.cc, key);
-        return socket;
-      }
-      markRelayDead(key);
+    // 整池都不通：挑最快恢复的那条再试一次（只降权不排除）
+    const leastBad = pool.slice().sort((a, b) => relayScoreOf(a.key) - relayScoreOf(b.key))[0];
+    if (leastBad) {
+      relayStats.leastBad += 1;
+      const winner = await raceRelays([leastBad], payload, RELAY_TRY_TIMEOUT);
+      if (winner) { relaySticky.set(slot, winner.item.key); return winner.socket; }
     }
     return null;
   };
@@ -1297,6 +2533,7 @@ async function openTargetInner(address, port, payload, forceRelay = false, pinne
       try {
         const winner = await Promise.any(attempts);
         premiumGood.set(pinned.key, winner.addr);
+        notePremiumOk(pinned.key);
         attempts.forEach((pending) => pending.then((item) => {
           if (item.addr !== winner.addr) closeSocket(item.socket);
         }).catch(() => {}));
@@ -1316,9 +2553,37 @@ async function openTargetInner(address, port, payload, forceRelay = false, pinne
     if (direct) return direct;
     throw new Error('直连失败');
   }
+  if (relayRegion === 'PURE') {
+    // 纯净中转：候选是中转机（出口就是机器自己的 IPv4）。不钉 IP，运行时抢，赢家记住，死了冷却换下一批
+    const cached = pureAddrs();
+    let order = cached.map((addr) => {
+      const hit = (pureCache.list || []).find((item) => item.addr === addr) || {};
+      const [host, portText] = addr.split(':');
+      return { key: addr, ip: host, port: Number(portText) || 443, cc: hit.egressLoc || '' };
+    });
+    if (!order.length) {
+      order = pureShuffle(pureCandidatePool()).slice(0, PURE_RACE * 3);
+      pureDebug.pool = pureCandidatePool().length;
+    }
+    const rounds = Math.min(3, Math.max(1, Math.ceil(order.length / PURE_RACE)));
+    for (let round = 0; round < rounds; round += 1) {
+      const batch = order.splice(0, PURE_RACE);
+      if (!batch.length) break;
+      const winner = await raceRelays(batch, payload, Math.max(6500, PREMIUM_TRY_TIMEOUT));
+      if (winner) {
+        pureOk.set(winner.item.key, Date.now());
+        pureDead.delete(winner.item.key);
+        return winner.socket;
+      }
+      for (const item of batch) pureDead.set(item.key, Date.now());
+    }
+    kickPureProbe();
+    throw new Error('纯净中转暂无可用出口');
+  }
   if (relayRegion) {
     const matched = await tryRelayRegion(relayRegion);
     if (matched) return matched;
+    throw new Error('该地区暂无可用中转');   // 宁可报错也不拿别的地区顶替（节点名写着哪个区就得是哪个区）
   }
   const anyRelay = await tryRelayRegion('');
   if (anyRelay) return anyRelay;
@@ -2407,13 +3672,26 @@ function buildVisaNodes(hostName) {
 }
 
 // 优质代理节点：每条锁定一个国家/地区的一条固定出口（名字里带地区，方便一眼看出来）
-async function buildPremiumNodes(hostName) {
-  let pool = [];
-  try {
-    pool = await fetchPremiumPool();
-  } catch (error) {
-    pool = [];
+async function buildPremiumNodes(hostName, sharedPool = null, waitMs = 0) {
+  let pool = sharedPool;
+  if (pool && typeof pool.then === 'function') {
+    try {
+      // 等太久就先用上次的结果，别让一份配置卡在代理池上（旧版这里死等，冷启动直接 6~8 秒）
+      pool = waitMs > 0
+        ? await Promise.race([pool, new Promise((resolve) => setTimeout(() => resolve(null), waitMs))])
+        : await pool;
+    } catch (error) {
+      pool = null;
+    }
   }
+  if (!pool && !waitMs) {
+    try {
+      pool = await fetchPremiumPool();
+    } catch (error) {
+      pool = [];
+    }
+  }
+  if (!pool) pool = premiumCache.list || [];
   const nodes = [];
   for (const item of pool) {
     if (nodes.length >= PREMIUM_LIMIT) break;
@@ -2441,7 +3719,120 @@ async function buildPremiumNodes(hostName) {
   return nodes;
 }
 
-async function buildContext(request, mode = 'relay') {
+// 纯净中转：只出现在「节点选择」里的一种中转节点（group='pure' 不会被任何自动组选中）
+function pureShuffle(list) {
+  const arr = list.slice();
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// 候选池：中转机（都是 IPv4）+ 内置兜底里能用的
+function pureCandidatePool() {
+  const items = relayPool443();
+  for (const item of fallbackRelays('')) {
+    if (!isIPv4(item.ip)) continue;
+    if (items.some((old) => old.key === item.key)) continue;
+    items.push(item);
+  }
+  return items;
+}
+
+async function pureProbeBatch() {
+  const pool = pureCandidatePool();
+  pureDebug.pool = pool.length;
+  const freshen = new Set((pureCache.list || []).map((item) => item.key));
+  const cands = [];
+  for (const item of pureShuffle(pool)) {
+    if (cands.length >= PURE_SAMPLE) break;
+    const dead = pureDead.get(item.key);
+    if (dead && Date.now() - dead < PURE_DEAD_TTL) continue;
+    if (freshen.has(item.key)) continue;      // 已经在缓存里的不用重测
+    cands.push(item);
+  }
+  pureDebug.cands = cands.length;
+  pureDebug.picked = cands.length;
+  const good = [];
+  for (let index = 0; index < cands.length; index += PURE_RACE) {
+    const batch = cands.slice(index, index + PURE_RACE);
+    const settled = await Promise.allSettled(batch.map(async (item) => {
+      pureDebug.tried += 1;
+      return { item, result: await probePureRelayIp(item.ip, item.port, PURE_PROBE_TIMEOUT) };
+    }));
+    for (const row of settled) {
+      if (row.status !== 'fulfilled') continue;
+      const { item, result } = row.value;
+      if (result) {
+        good.push({ key: item.key, addr: item.ip + ':' + item.port, ip: item.ip, port: item.port, egressIp: result.ip, egressLoc: result.loc, rtt: result.ms, okAt: Date.now() });
+      } else {
+        pureDead.set(item.key, Date.now());
+      }
+    }
+    if (good.length >= PURE_LIMIT * 2) break;   // 攒够就停，省 subrequest
+  }
+  if (good.length) {
+    const merged = good.concat((pureCache.list || []).filter((old) => !good.some((item) => item.key === old.key)));
+    pureCache = { list: merged.slice(0, 12), at: Date.now() };
+  }
+  return good;
+}
+
+// 后台补测：不阻塞正在返回的响应
+function kickPureProbe() {
+  const waiter = runtimeCtx;
+  if (pureProbing || !waiter || typeof waiter.waitUntil !== 'function') return;
+  pureProbing = true;
+  pureDebug.started = (pureDebug.started || 0) + 1;
+  pureDebug.ctx = true;
+  waiter.waitUntil(pureProbeBatch()
+    .catch((error) => { pureDebug.batchError = (error && error.message) || String(error); })
+    .finally(() => { pureProbing = false; pureDebug.ranAt = Date.now(); }));
+}
+
+// 排序：刚连通过的优先 → 延迟低的优先 → 冷却中的跳过
+function pureAddrs() {
+  const now = Date.now();
+  const rows = (pureCache.list || [])
+    .filter((item) => item && item.addr && !(pureDead.get(item.addr) && now - pureDead.get(item.addr) < PURE_DEAD_TTL))
+    .map((item) => ({ addr: item.addr, rtt: item.rtt || 0, okAt: pureOk.get(item.addr) || 0 }))
+    .sort((a, b) => (b.okAt - a.okAt) || (a.rtt - b.rtt));
+  return rows.map((item) => item.addr);
+}
+
+async function buildPureNodes(hostName, ctx = null) {
+  if (ctx && typeof ctx.waitUntil === 'function') runtimeCtx = ctx;
+  if (!(pureCache.list.length && Date.now() - pureCache.at < PURE_TTL)) kickPureProbe();
+  const best = pureCache.list.slice(0, PURE_LIMIT);
+  if (!best.length) return [pureNodeOf({}, 0, hostName)];   // 缓存空也常驻，运行时现挑现换
+  return best.map((item, index) => pureNodeOf(item, index, hostName));
+}
+function pureNodeOf(item, index, hostName) {
+  return {
+    name: '🌍 纯净中转' + (index ? ' ' + (index + 1) : '') + (item.egressLoc ? '·' + item.egressLoc : '') + (item.rtt ? '·' + item.rtt + 'ms' : '') + (item.reliable ? '·✓' : ''),
+    server: hostName,
+    port: 443,
+    uuid: userID,
+    host: hostName,
+    // 不钉具体代理：运行时自己挑、自己换（缓存里有记忆），这样单条挂了也不影响这个节点
+    path: WS_PATH + '&mode=relay&rg=PURE',
+    tls: true,
+    region: '纯净中转',
+    flag: '🌍',
+    country: 'PURE',
+    city: item.egressLoc || '',
+    speed: 0,
+    latency: item.rtt || 0,
+    score: 0,
+    group: 'pure',
+    relayNode: true,
+    pureNode: true,
+  };
+}
+
+async function buildContext(request, mode = 'relay', ctx = null) {
+  try { runtimeHost = new URL(request.url).host; } catch (error) {}
   const hostName = request.headers.get('Host') || new URL(request.url).host;
 
   let snapshot;
@@ -2483,23 +3874,55 @@ async function buildContext(request, mode = 'relay') {
     relayNode: false,
   }));
   // 优质代理：只在「自动代理」组里追加，不改动上面 5 个代理-优化的行为
-  const proxyPremium = await buildPremiumNodes(hostName);
+  // 代理池抓取和「自动高速」的中转探测并行跑：先起探测，池子用 promise 传下去
+  const premiumPromise = fetchPremiumPool().catch(() => null);
+  // 生成配置时顺手补测几条中转出口带宽：这是唯一稳定会跑到的时机（热路径不阻塞，丢后台）
+  try { await loadRelayList(); kickRelayQuality(hostName, 4); } catch (error) {}
+  // 让代理池的抓取不会被响应结束掐断：这次没等到，下次请求就能用上
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(premiumPromise);
+  const fastPromise = buildHighSpeedNodes(hostName, premiumPromise, ctx).catch(() => []);
+  const proxyPremium = await buildPremiumNodes(hostName, premiumPromise, PREMIUM_WAIT);
+
+  // 自动高速：现场测出站质量（风险 / 延迟 / 带宽），只把过关的中转和代理放进新组
+  let fastNodes = await fastPromise;
+  if (!Array.isArray(fastNodes)) fastNodes = [];
+
+  // 中转池里真实存在 443 IPv4 机器的地区：只有这些才生成「中转-地区」节点，
+  // 否则节点名写着某个地区、实际连的是别的地区（v1.0.7 的老毛病）
+  let relayRegionSet = null;
+  try {
+    await loadRelayList();
+    relayRegionSet = new Set(relayPool443().map((item) => item.cc).filter(Boolean));
+    // 主仓库缺的地区，问一下第二仓库有没有（并行，最多 4 个，失败就当没有）
+    const wanted = selected.regions.map((region) => region.code).filter((code) => !relayRegionSet.has(code)).slice(0, 4);
+    const looked = await Promise.allSettled(wanted.map(async (code) => ({ code, items: await loadAltRelay(code) })));
+    for (const row of looked) {
+      if (row.status !== 'fulfilled') continue;
+      if (row.value.items.length) relayRegionSet.add(row.value.code);
+    }
+  } catch (error) { relayRegionSet = null; }
 
   // 地区节点（优选 IP，热门地区每区最多 2 个）：同样派生「中转」和「直连」
   const relayRegionNodes = [];
   const directRegionNodes = [];
   for (const region of selected.regions) {
+    // 中转优先 IPv4：本区只要还有 IPv4 入口，就不生成 IPv6 的中转节点；整区都没 IPv4 时才退回 IPv6
+    const regionHasV4 = region.nodes.some((entry) => isIPv4(entry.ip || entry.server));
     region.nodes.forEach((entry, index) => {
       const suffix = region.nodes.length > 1 ? String(index + 1) : '';
       const baseName = REGION_NAMES[region.code] || region.name || region.code;
-      relayRegionNodes.push({
-        ...entry,
-        name: countryFlag(region.code) + ' 中转-' + baseName + (suffix ? ' ' + suffix : ''),
-        path: WS_PATH + '&mode=relay&rg=' + region.code,
-        group: 'relay',
-        relayNode: true,
-        relayRegion: region.code,
-      });
+      const entryV4 = isIPv4(entry.ip || entry.server);
+      const relayable = (!relayRegionSet || relayRegionSet.has(region.code)) && (entryV4 || !regionHasV4);
+      if (relayable) {
+        relayRegionNodes.push({
+          ...entry,
+          name: countryFlag(region.code) + ' 中转-' + baseName + (suffix ? ' ' + suffix : ''),
+          path: WS_PATH + '&mode=relay&rg=' + region.code,
+          group: 'relay',
+          relayNode: true,
+          relayRegion: region.code,
+        });
+      }
       directRegionNodes.push({
         ...entry,
         name: countryFlag(region.code) + ' 直连-' + baseName + (suffix ? ' ' + suffix : ''),
@@ -2510,16 +3933,23 @@ async function buildContext(request, mode = 'relay') {
     });
   }
 
-  const nodes = relayOptimized.concat(relayRegionNodes).concat(directOptimized).concat(directRegionNodes).concat(proxyOptimized).concat(proxyPremium);
+  // 纯净中转：单独一组，只进「节点选择」
+  let pureNodes = [];
+  try { pureNodes = await buildPureNodes(hostName, ctx); } catch (error) { pureNodes = []; }
+
+  // 纯净中转排最前：它是「无污染出口」的首选，客户端一眼就能选到
+  const nodes = pureNodes.concat(relayOptimized).concat(relayRegionNodes).concat(directOptimized).concat(directRegionNodes).concat(proxyOptimized).concat(proxyPremium).concat(fastNodes);
   if (!nodes.length) throw new Error(snapshot.error || '没有可用节点');
 
   return {
     hostName,
     nodes,
+    fastNodes,
     hostNodes: buildHostNodes(hostName),
     visaNodes: buildVisaNodes(hostName),
     relayNodes: relayOptimized.concat(relayRegionNodes),
     regions: selected.regions,
+    total: snapshot.entries.length,
     unique: new Set(snapshot.entries.map((entry) => entry.ip + '|' + entry.port)).size,
     sourceUrl: snapshot.sourceUrl,
     fetchedAt: snapshot.fetchedAt,
@@ -2644,26 +4074,38 @@ function yamlGroups(nodes, meta = false) {
   const relayList = pick('relay');
   const directList = pick('direct');
   const proxyList = pick('proxy');
+  const fastList = pick('fast');
+  const pureList = pick('pure');
 
   const groups = [];
   const menu = [];
   if (relayList.length) menu.push('    - 🔀 自动中转');
   if (directList.length) menu.push('    - 🚀 自动直连');
   if (proxyList.length) menu.push('    - 🛡 自动代理');
+  if (fastList.length) menu.push('    - ' + HS_NAME);
   menu.push('    - ' + (meta ? '不使用节点' : 'DIRECT'));
+
+  // 纯净中转排最前面（单节点，不带分组），其余节点按原顺序跟在分组后面
+  const pureEntries = pureList.map((node) => '    - ' + quoteYaml(node.name));
+  const restEntries = nodes.filter((node) => node.group !== 'pure').map((node) => '    - ' + quoteYaml(node.name));
 
   groups.push([
     '- name: 🚀 节点选择',
     '  type: select',
     '  proxies:',
+    ...pureEntries,
     ...menu,
-    ...nodes.map((node) => "    - " + quoteYaml(node.name)),
+    ...restEntries,
   ].join('\n'));
 
   for (const [name, list] of [['🔀 自动中转', relayList], ['🚀 自动直连', directList], ['🛡 自动代理', proxyList]]) {
     const block = build(name, list);
     if (block) groups.push(block);
   }
+
+  // 自动高速：排在自动代理后面；只有测过关的才进来，一条都没有就不出这个组
+  const fastBlock = build(HS_NAME, fastList);
+  if (fastBlock) groups.push(fastBlock);
 
   return 'proxy-groups:\n' + groups.join('\n');
 }
@@ -2739,8 +4181,8 @@ function yamlDocument(context, kind, meta = false) {
   ], rules).join('\n') + '\n';
 }
 
-async function handleSubscription(request, kind, mode = 'relay') {
-  const context = await buildContext(request, mode);
+async function handleSubscription(request, kind, mode = 'relay', ctx = null) {
+  const context = await buildContext(request, mode, ctx);
   const url = new URL(request.url);
   const ua = request.headers.get('user-agent') || '';
   // Meta 内核支持 unified-delay（延迟显示会扣掉握手），老内核不支持
