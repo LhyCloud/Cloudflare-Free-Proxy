@@ -43,7 +43,7 @@ import { connect } from 'cloudflare:sockets';
 // 面板标题：浏览器标签页 + 页面大标题（下载页会带上前缀）；纯展示，改这里就能整套换名
 const PANEL_TITLE = 'Cloudflare免费代理';
 
-const PAGE_VERSION = 'v1.0.8';
+const PAGE_VERSION = 'v1.0.8b';
 
 // 面板 / 订阅路径里的密码：只有 /<PASSWORD>/... 能访问
 const PASSWORD = 'cfnode2026';
@@ -148,7 +148,7 @@ const RELAY_ALT_SOURCES = (cc) => [
   'https://cdn.jsdelivr.net/gh/Xiaobei09/proxyip@main/data/valid/countries/' + cc + '/good_v4_top.txt',
   'https://cdn.jsdelivr.net/gh/Xiaobei09/proxyip@main/data/valid/countries/' + cc + '/good_v4.txt',
 ];
-// 纯净中转：用 x.com 的 /cdn-cgi/trace 现场验出站，只留「IPv4 出站 + 能上推」的机器
+// 优质稳定中转：用 x.com 的 /cdn-cgi/trace 现场验出站，只留「IPv4 出站 + 能上推」的机器
 const PURE_TARGET_HOST = 'x.com';
 const PURE_LIMIT = 1;
 const PURE_SAMPLE = 16;
@@ -256,6 +256,8 @@ const CITY_NAMES = {
 };
 // 地区中文名（没收录的国家直接显示两位国家代码）
 const REGION_NAMES = {
+  BH: '巴林', DO: '多米尼加', AL: '阿尔巴尼亚', MK: '北马其顿', IR: '伊朗',
+  KG: '吉尔吉斯斯坦', AZ: '阿塞拜疆', OM: '阿曼', LU: '卢森堡', LB: '黎巴嫩',
   US: '美国', CA: '加拿大', MX: '墨西哥', BR: '巴西', AR: '阿根廷', CL: '智利',
   GB: '英国', IE: '爱尔兰', DE: '德国', NL: '荷兰', FR: '法国', BE: '比利时',
   CH: '瑞士', AT: '奥地利', IT: '意大利', ES: '西班牙', PT: '葡萄牙', PL: '波兰',
@@ -364,20 +366,6 @@ export default {
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         });
       }
-      if (pathname === base + '/hs/speed') {
-        const bytes = Math.min(524288, Math.max(1024, Number(url.searchParams.get('bytes')) || HS_SPEED_BYTES));
-        const body = new Uint8Array(bytes);
-        for (let index = 0; index < bytes; index += 1) body[index] = (index * 31 + 7) & 255;
-        return new Response(body, {
-          headers: {
-            'content-type': 'application/octet-stream',
-            'cache-control': 'no-store',
-            'content-length': String(bytes),
-          },
-        });
-      }
-      // 自动高速的现状（调试用）：看这个 isolate 里记住了哪些高质 IP
-      if (pathname === base + '/hs') return handleHighSpeedStatus();
       // 单条中转试测（调试用）：?ip=1.2.3.4&port=443
       if (pathname === base + '/rq/try') {
         const ip = String(url.searchParams.get('ip') || '').trim();
@@ -385,7 +373,8 @@ export default {
         const target = runtimeHost || new URL(url.toString()).host;
         const item = { key: ip + ':' + port, ip, port, cc: '' };
         const record = ip ? await probeRelayQuality(item, target, 9000) : null;
-        return new Response(JSON.stringify({ pageVersion: PAGE_VERSION, item, target, record }, null, 2), {
+        const stored = relayQuality.get(item.key) || null;
+        return new Response(JSON.stringify({ pageVersion: PAGE_VERSION, item, target, record, stored }, null, 2), {
           headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
         });
       }
@@ -422,19 +411,6 @@ export default {
         }
         const body = { version: PAGE_VERSION, debug: premiumDebug, cacheSize: (premiumCache.list || []).length, egressCached: premiumEgressCache.size, sources, list: premiumCache.list || [], at: premiumCache.at };
         return new Response(JSON.stringify(body, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
-      }
-      // 单条带宽探测（调试用）：/<密码>/hs/try?ip=1.2.3.4:443&kind=relay
-      if (pathname === base + '/hs/try') {
-        const raw = String(url.searchParams.get('ip') || '');
-        const kind = String(url.searchParams.get('kind') || 'relay');
-        const matched = raw.match(/^([^:\s]+):(\d{1,5})$/);
-        if (!matched) return new Response(JSON.stringify({ error: 'ip 参数要写成 ip:port' }), { status: 400, headers: { 'content-type': 'application/json' } });
-        const trace = [];
-        const started = Date.now();
-        const result = await hsTlsProbe(kind, matched[1], Number(matched[2]), new URL(request.url).host, trace);
-        return new Response(JSON.stringify({ result, trace, ms: Date.now() - started, tlsBroken: hsTlsBroken }, null, 2), {
-          headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-        });
       }
       if (pathname === base + '/cfw') return await handleSubscription(request, 'trojan', 'relay', ctx); // 老链接兼容
       if (pathname === base + '/vless' || pathname === base + '/cv') return await handleSubscription(request, 'vless', 'relay', ctx);
@@ -886,8 +862,7 @@ async function probePremiumCandidate(addr, kind, ms = PREMIUM_PROBE_TIMEOUT, tar
     }
     if (!tunnelOpen) return null;
     if (typeof socket.startTls !== 'function') {
-      // 运行时没有 startTls：退化成弱证据（CONNECT 200），但标记一下，方便 /hs 里看出来
-      hsTlsBroken = true;
+      // 运行时没有 startTls：退化成弱证据（CONNECT 200 就算通）
       premiumProbeCache.set(addr, { rtt: Date.now() - started, at: Date.now() });
       return Date.now() - started;
     }
@@ -1003,8 +978,7 @@ async function probeProxyEgressTls(addr, ms = PREMIUM_EGRESS_TIMEOUT) {
     }
     if (!/^HTTP\/1\.[01] 200/.test(head)) return null;
     if (typeof socket.startTls !== 'function') {
-      hsTlsBroken = true;
-      return null;
+            return null;
     }
     tls = socket.startTls({ expectedServerHostname: target });
     await withTimeout(tls.opened || Promise.resolve(), Math.max(300, ms - (Date.now() - started)), 'TLS 握手');
@@ -1062,7 +1036,7 @@ async function probeProxyTlsAlive(addr, ms = PREMIUM_EGRESS_TIMEOUT) {
       try { reader.releaseLock(); } catch (error) {}
     }
     if (!/^HTTP\/1\.[01] 200/.test(head)) return 0;
-    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; return 0; }
+    if (typeof socket.startTls !== 'function') { return 0; }
     tls = socket.startTls({ expectedServerHostname: target });
     await withTimeout(tls.opened || Promise.resolve(), Math.max(600, ms - (Date.now() - started)), 'TLS 握手');
     await writeSocketTimed(tls, textEncoder.encode('HEAD /generate_204 HTTP/1.1\r\nHost: ' + target + '\r\nUser-Agent: px-alive\r\nConnection: close\r\n\r\n'), ms);
@@ -1171,90 +1145,6 @@ async function verifyPremiumPool(list) {
   return out;
 }
 
-/* --------------------------------------------------------------------------
- * 自动高速（v1.0.8 新增）：生成配置时就地测「出站质量」，只把过关的中转 / 代理
- * 单独放进「⚡ 自动高速」组。旧的「自动中转 / 自动直连 / 自动代理」机制一行没动。
- *
- * 三条判据：
- *   1) 风险：ip-api 批量查入口 IP 的 proxy / hosting / as —— 机房 IP 比公开代理干净，
- *      住宅 IP 最好（x.com、chatgpt 这类风控认的就是这几个字段）；
- *   2) 延迟：Worker 到该 IP 的 TCP 握手耗时（socket.opened，不写业务数据）；
- *   3) 带宽：经该 IP 起 TLS 打自己 Worker 的 /<密码>/hs/speed?bytes=N，
- *      用「读到的字节 ÷ 用时」折算 Mbps（startTls 指定 SNI 才能跟 CF 边缘握手）。
- *
- * 结论永久存 isolate 内存（hsGood），每 HS_RETEST_MS 复测一次；复测变差就踢出，
- * 踢掉的进 hsDead 冷却一阵再放回来重测。
- * -------------------------------------------------------------------------- */
-const HS_NAME = '⚡ 自动高速';
-const HS_FIELDS = 'status,message,country,countryCode,region,regionName,city,isp,org,as,proxy,hosting,query';
-const HS_RELAY_SAMPLE = 24;     // 一次最多测多少条中转
-const HS_PROXY_SAMPLE = 12;     // 一次最多测多少条代理
-const HS_RACE = 5;              // 并发探测数（留 2 个连接额度给正常请求）
-const HS_TCP_TIMEOUT = 1200;
-const HS_TLS_TIMEOUT = 2600;
-const HS_TLS_BATCH = 8;         // 只对延迟最好的前 N 条测带宽
-const HS_READ_BUDGET = 900;     // 带宽取样窗口（ms）
-const HS_SPEED_BYTES = 262144;  // 取样上限 256 KB
-const HS_MIN_MBPS = 1.2;        // 低于这个不算「大带宽」
-const HS_MAX_RTT = 900;         // 高于这个不算「低延迟」
-const HS_MAX_RISK = 1;          // 中转：只接受机房 / 家宽（proxy=false）
-const HS_PROXY_MAX_RISK = 3;    // 代理：公开代理天然带 proxy=true，放宽到 3
-const HS_RETEST_MS = 2 * 60 * 60 * 1000;    // 高质节点 2 小时复测一次（旧 30 分钟太勤）
-const HS_DEAD_TTL = 10 * 60 * 1000;
-const HS_BUDGET = 5000;         // 后台补测的总预算，超了就用已测出来的
-const HS_COLD_BUDGET = 1200;    // 冷启动时同步等这么久（只在这个 isolate 第一次生成配置时发生）
-const HS_LIMIT = 80;
-const hsGood = new Map();       // key(种类|地址) -> { at, kind, addr, ip, port, cc, risk, rtt, mbps, isp, as, country, city }
-const hsDead = new Map();
-let hsTlsBroken = false;        // 运行时没有 startTls(选项) 时退化成「只看延迟 + 风险」
-let hsLastError = '';           // 最近一次带宽探测卡在哪一步（/hs 里会吐出来，纯调试用）
-let hsWarm = false;             // 这个 isolate 是否已经跑过一轮探测
-
-function hsRiskOf(meta) {
-  if (!meta || meta.status !== 'success') return 0;   // 查不到（多半是 ip-api 限流）不算风险，别把好 IP 误杀
-  let risk = 0;
-  if (meta.proxy === true) risk += 3;
-  if (meta.hosting === true) risk += 1;
-  return risk;
-}
-
-// 批量查风险（ip-api 批量接口：一次 100 个 IP，不烧单条配额）
-async function hsBatchMeta(ips) {
-  const out = new Map();
-  const list = Array.from(new Set((ips || []).filter((ip) => /^\d{1,3}(\.\d{1,3}){3}$/.test(String(ip || '')))));
-  for (let index = 0; index < list.length; index += 100) {
-    const chunk = list.slice(index, index + 100);
-    try {
-      const response = await fetch('http://ip-api.com/batch?fields=' + HS_FIELDS, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(chunk.map((ip) => ({ query: ip }))),
-      });
-      if (!response.ok) continue;
-      const rows = await response.json();
-      if (!Array.isArray(rows)) continue;
-      rows.forEach((row, i) => {
-        if (row && row.status === 'success' && chunk[i]) out.set(chunk[i], row);
-      });
-    } catch (error) {}
-  }
-  return out;
-}
-
-// TCP 握手耗时（只连不发，纯连通性 + 延迟）
-async function hsTcpRtt(host, port, ms = HS_TCP_TIMEOUT) {
-  const started = Date.now();
-  let socket = null;
-  try {
-    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
-    await withTimeout(socket.opened || Promise.resolve(), ms, 'TCP 握手');
-    return Date.now() - started;
-  } catch (error) {
-    return null;
-  } finally {
-    closeSocket(socket);
-  }
-}
 
 // 读一小段（带宽取样 / 读 CONNECT 应答），返回 { text(前 512 字节), bytes }
 async function hsReadSome(socket, budget, cap) {
@@ -1285,79 +1175,7 @@ async function hsReadSome(socket, budget, cap) {
   return { text, bytes };
 }
 
-// 经一个入口（中转 IP / HTTP 代理）跟自己的 Worker 建 TLS，量真实带宽
-async function hsTlsProbe(kind, host, port, hostName, trace = null) {
-  let socket = null;
-  let tls = null;
-  const steps = [];
-  const note = (text) => { steps.push(text); if (trace) trace.push(text); };
-  try {
-    note('connect ' + host + ':' + port);
-    socket = connect({ hostname: host, port }, { secureTransport: 'starttls' });
-    await withTimeout(socket.opened || Promise.resolve(), HS_TCP_TIMEOUT, 'TCP 握手');
-    note('tcp ok');
-    if (kind === 'http') {
-      const connectReq = 'CONNECT ' + hostName + ':443 HTTP/1.1\r\nHost: ' + hostName + ':443\r\n\r\n';
-      await writeSocketTimed(socket, textEncoder.encode(connectReq), HS_TCP_TIMEOUT);
-      const head = await hsReadSome(socket, HS_TCP_TIMEOUT, 512);
-      if (!/^HTTP\/1\.[01] 200/.test(head.text)) { note('CONNECT 未回 200: ' + head.text.slice(0, 60)); return null; }
-      note('CONNECT 200');
-    }
-    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; note('没有 startTls'); return null; }
-    tls = socket.startTls({ expectedServerHostname: hostName });
-    note('startTls 已调用');
-    await withTimeout(tls.opened || Promise.resolve(), HS_TLS_TIMEOUT, 'TLS 握手');
-    note('tls ok');
-    const request = 'GET /' + PASSWORD + '/hs/speed?bytes=' + HS_SPEED_BYTES + ' HTTP/1.1\r\nHost: ' + hostName +
-      '\r\nUser-Agent: hs-probe\r\nAccept: */*\r\nConnection: close\r\n\r\n';
-    const started = Date.now();
-    await writeSocketTimed(tls, textEncoder.encode(request), HS_TLS_TIMEOUT);
-    note('请求已发出');
-    const stats = await hsReadSome(tls, HS_READ_BUDGET, HS_SPEED_BYTES);
-    const elapsed = Date.now() - started;
-    note('读到 ' + stats.bytes + 'B/' + elapsed + 'ms 头部 ' + JSON.stringify(stats.text.slice(0, 40)));
-    if (!/^HTTP\/1\.[01] 200/.test(stats.text)) return null;
-    if (elapsed <= 0 || stats.bytes < 4096) return null;
-    note('通过');
-    return { mbps: (stats.bytes * 8) / (elapsed / 1000) / 1e6, bytes: stats.bytes, ms: elapsed };
-  } catch (error) {
-    const msg = String((error && error.message) || error);
-    note('异常: ' + msg);
-    if (/starttls/i.test(msg)) hsTlsBroken = true;
-    return null;
-  } finally {
-    if (!trace && steps.length) hsLastError = steps.join(' > ');
-    closeSocket(tls);
-    closeSocket(socket);
-  }
-}
-
-// 中转的强证据（v1.0.9）：经它起 TLS 跟 CF 边缘握手，并要求 /cdn-cgi/trace 回 200。
-// 只测 TCP 握手的中转大量是「连得上但打不开」，这一步把它们挡在外面。
-async function probeRelayEvidence(ip, port, ms = HS_TLS_TIMEOUT) {
-  let socket = null;
-  let tls = null;
-  try {
-    socket = connect({ hostname: ip, port }, { secureTransport: 'starttls' });
-    await withTimeout(socket.opened || Promise.resolve(), HS_TCP_TIMEOUT, 'TCP 握手');
-    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; return null; }
-    tls = socket.startTls({ expectedServerHostname: 'www.cloudflare.com' });
-    await withTimeout(tls.opened || Promise.resolve(), ms, 'TLS 握手');
-    const request = 'GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nUser-Agent: relay-probe\r\nConnection: close\r\n\r\n';
-    await writeSocketTimed(tls, textEncoder.encode(request), ms);
-    const stats = await hsReadSome(tls, ms, 2048);
-    if (!/^HTTP\/1\.[01] 200/.test(stats.text)) return null;
-    if (!/colo=|fl=|h=www\.cloudflare\.com/i.test(stats.text)) return null;
-    return { bytes: stats.bytes };
-  } catch (error) {
-    return null;
-  } finally {
-    closeSocket(tls);
-    closeSocket(socket);
-  }
-}
-
-// 纯净中转的候选改用「中转机」：中转机是按 SNI 转发到 CF 边缘的透传，出口就是那台机器自己的 IP。
+// 优质稳定中转的候选改用「中转机」：中转机是按 SNI 转发到 CF 边缘的透传，出口就是那台机器自己的 IP。
 // 做法：连它 → 用 www.cloudflare.com 做 SNI 完成 TLS → 读 /cdn-cgi/trace，出口不是 IPv4 就淘汰。
 async function probePureRelayIp(ip, port, ms = PURE_PROBE_TIMEOUT) {
   let socket = null;
@@ -1365,8 +1183,8 @@ async function probePureRelayIp(ip, port, ms = PURE_PROBE_TIMEOUT) {
   const started = Date.now();
   try {
     socket = connect({ hostname: ip, port }, { secureTransport: 'starttls' });
-    await withTimeout(socket.opened || Promise.resolve(), HS_TCP_TIMEOUT, 'TCP 握手');
-    if (typeof socket.startTls !== 'function') { hsTlsBroken = true; pureDebug.tlsBroken = true; return null; }
+    await withTimeout(socket.opened || Promise.resolve(), 2500, 'TCP 握手');
+    if (typeof socket.startTls !== 'function') { pureDebug.tlsBroken = true; return null; }
     tls = socket.startTls({ expectedServerHostname: 'www.cloudflare.com' });
     await withTimeout(tls.opened || Promise.resolve(), ms, 'TLS 握手');
     const request = 'GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nUser-Agent: pure-probe\r\nConnection: close\r\n\r\n';
@@ -1388,243 +1206,6 @@ async function probePureRelayIp(ip, port, ms = PURE_PROBE_TIMEOUT) {
     closeSocket(tls);
     closeSocket(socket);
   }
-}
-
-function hsKeyOf(item) {
-  return item.kind + '|' + item.addr;
-}
-
-// 挑要测的候选：没测过的优先，其次该复测的，死了的先跳过
-function hsPick(list, count) {
-  const fresh = [];
-  const stale = [];
-  for (const item of list) {
-    if (!item || !item.ip) continue;
-    const key = hsKeyOf(item);
-    const deadAt = hsDead.get(key);
-    if (deadAt) {
-      if (Date.now() - deadAt < HS_DEAD_TTL) continue;
-      hsDead.delete(key);
-    }
-    const record = hsGood.get(key);
-    if (record && Date.now() - record.at < HS_RETEST_MS) continue;   // 还新鲜，不用重测
-    (record ? stale : fresh).push(item);
-  }
-  const shuffle = (arr) => {
-    for (let i = arr.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-  };
-  return shuffle(fresh).concat(shuffle(stale)).slice(0, count);
-}
-
-// 探一批候选：风险（ip-api 批量）→ 延迟（TCP）→ 带宽（TLS 打自己）
-async function hsProbe(list, hostName, deadline) {
-  if (!list.length) return;
-  const meta = await hsBatchMeta(list.map((item) => item.ip));
-  const usable = [];
-  for (const item of list) {
-    const info = meta.get(item.ip) || null;
-    const risk = hsRiskOf(info);
-    const riskLimit = item.kind === 'http' ? HS_PROXY_MAX_RISK : HS_MAX_RISK;
-    if (risk > riskLimit) {
-      hsDead.set(hsKeyOf(item), Date.now());
-      continue;
-    }
-    usable.push({ ...item, risk, info });
-  }
-  const alive = [];
-  for (let index = 0; index < usable.length; index += HS_RACE) {
-    if (Date.now() > deadline) break;
-    const batch = usable.slice(index, index + HS_RACE);
-    const settled = await Promise.all(batch.map(async (item) => ({ item, rtt: await hsTcpRtt(item.ip, item.port) })));
-    for (const row of settled) {
-      if (row.rtt == null || row.rtt > HS_MAX_RTT) continue;
-      alive.push({ ...row.item, rtt: row.rtt, mbps: null });
-    }
-  }
-  alive.sort((a, b) => a.rtt - b.rtt);
-  // 中转先过「强证据」：能摸到 CF 边缘才算出口，摸不到的踢进冷却
-  const relayTargets = hsTlsBroken ? [] : alive.filter((item) => item.kind === 'relay').slice(0, HS_TLS_BATCH);
-  for (let index = 0; index < relayTargets.length; index += 2) {
-    if (Date.now() > deadline) break;
-    const batch = relayTargets.slice(index, index + 2);
-    const settled = await Promise.all(batch.map(async (item) => ({ item, ok: Boolean(await probeRelayEvidence(item.ip, item.port)) })));
-    for (const row of settled) {
-      // 只把「测过且失败」的踢掉：预算用完没测到的保留（按延迟排后面），否则冷启动会一个节点都不剩
-      if (row.ok) row.item.evidence = true; else row.item.evidenceFailed = true;
-    }
-  }
-  const verified = alive.filter((item) => item.kind !== 'relay' || item.evidence === true || item.evidenceFailed !== true);
-  // 带宽只测最快的那几条代理（每条要起 TLS，贵）
-  const tlsTargets = hsTlsBroken ? [] : verified.filter((item) => item.kind === 'http').slice(0, HS_TLS_BATCH);
-  const probeTls = async (item) => {
-    const result = await hsTlsProbe(item.kind, item.ip, item.port, hostName);
-    if (result) {
-      item.mbps = result.mbps;
-      item.bytes = result.bytes;
-    }
-  };
-  for (let index = 0; index < tlsTargets.length; index += 2) {
-    if (Date.now() > deadline) break;
-    await Promise.all(tlsTargets.slice(index, index + 2).map(probeTls));
-  }
-  // 落库：带宽测到的按带宽排，没测到的（TLS 不可用 / 超时）只要延迟低也留着
-  for (const item of verified) {
-    const key = hsKeyOf(item);
-    const info = item.info || {};
-    const ok = item.mbps == null ? item.rtt <= HS_MAX_RTT : item.mbps >= HS_MIN_MBPS;
-    if (!ok) { hsDead.set(key, Date.now()); continue; }
-    hsGood.set(key, {
-      at: Date.now(),
-      kind: item.kind,
-      addr: item.addr,
-      ip: item.ip,
-      port: item.port,
-      cc: item.cc || '',
-      risk: item.risk,
-      rtt: item.rtt,
-      mbps: item.mbps == null ? null : Number(item.mbps.toFixed(1)),
-      country: String(info.countryCode || item.cc || '').toUpperCase(),
-      city: String(info.city || ''),
-      isp: String(info.isp || ''),
-      as: String(info.as || ''),
-    });
-  }
-}
-
-// 把 hsGood 里的高质 IP 变成节点（中转 + 代理都有）
-async function buildHighSpeedNodes(hostName, premiumPool, ctx) {
-  let relayItems = [];
-  try { relayItems = await loadRelayList(); } catch (error) { relayItems = []; }
-  const relayPool = (relayItems || [])
-    .filter((item) => item.port === 443 && item.ip)
-    .map((item) => ({ kind: 'relay', addr: item.ip + ':443', ip: item.ip, port: 443, cc: item.cc }));
-  const relays = hsPick(relayPool, HS_RELAY_SAMPLE);
-
-  // 面板也会走 buildContext，但它不需要等探测结果（ctx 为空就是面板在渲染）
-  const cold = !hsWarm && ctx ? HS_COLD_BUDGET : 0;
-  hsWarm = true;
-  // 中转先测：这段时间正好和「代理池抓取」并行跑，省一次串行等待
-  if (relays.length && cold) {
-    try { await hsProbe(relays, hostName, Date.now() + cold); } catch (error) {}
-  }
-
-  // 代理池可能还在飞：一律不等。HS 组先用已有记录出节点，代理候选在响应之后自己排队测
-  if (ctx && typeof ctx.waitUntil === 'function') {
-    const rest = relays.filter((item) => !hsGood.has(hsKeyOf(item)) && !hsDead.has(hsKeyOf(item)));
-    if (rest.length) ctx.waitUntil(hsProbe(rest.slice(0, 40), hostName, Date.now() + 20000).catch(() => {}));
-    ctx.waitUntil((async () => {
-      let pool = premiumPool;
-      if (pool && typeof pool.then === 'function') {
-        try { pool = await pool; } catch (error) { pool = null; }
-      }
-      const proxyPool = [];
-      for (const item of pool || []) {
-        const addr = (item.addrs || [])[0];
-        if (!addr) continue;
-        const colon = addr.lastIndexOf(':');
-        if (colon <= 0) continue;
-        proxyPool.push({ kind: 'http', addr, ip: addr.slice(0, colon), port: Number(addr.slice(colon + 1)), cc: item.cc });
-      }
-      const proxies = hsPick(proxyPool, HS_PROXY_SAMPLE).filter((item) => !hsGood.has(hsKeyOf(item)) && !hsDead.has(hsKeyOf(item)));
-      if (proxies.length) await hsProbe(proxies, hostName, Date.now() + 15000);
-    })().catch(() => {}));
-  }
-  const records = Array.from(hsGood.values())
-    .filter((record) => record && record.ip)
-    .sort((a, b) => {
-      const bandwidth = (b.mbps || 0) - (a.mbps || 0);
-      if (Math.abs(bandwidth) > 0.01) return bandwidth;
-      return a.rtt - b.rtt;
-    })
-    .slice(0, HS_LIMIT);
-
-  const nodes = [];
-  for (const record of records) {
-    const code = String(record.country || record.cc || '').toUpperCase();
-    const region = REGION_NAMES[code] || code || '未知';
-    const flag = countryFlag(code);
-    const label = (record.kind === 'relay' ? '高速-中转-' : '高速-代理-') + region;
-    // 客户端不显示实测数值（m05901）：名字里只留地区，质量差异交给 url-test 自己测
-    const metric = '';
-    const name = flag + ' ' + label + ' ' + (nodes.length + 1) + metric;
-    if (record.kind === 'relay') {
-      nodes.push({
-        name,
-        server: record.ip,
-        port: record.port,
-        uuid: userID,
-        host: hostName,
-        path: WS_PATH + '&mode=relay' + (record.cc ? '&rg=' + record.cc : ''),
-        tls: true,
-        region: '自动高速',
-        flag,
-        country: code,
-        city: record.city || '',
-        speed: 0,
-        latency: record.rtt,
-        score: 0,
-        group: 'fast',
-        relayNode: true,
-        relayRegion: record.cc || '',
-        fastNode: true,
-        fastKind: 'relay',
-      });
-    } else {
-      nodes.push({
-        name,
-        server: hostName,
-        port: 443,
-        uuid: userID,
-        host: hostName,
-        path: WS_PATH + '&mode=proxy&px=' + encodeURIComponent('http|' + record.addr),
-        tls: true,
-        region: '自动高速',
-        flag,
-        country: code,
-        city: record.city || '',
-        speed: 0,
-        latency: record.rtt,
-        score: 0,
-        group: 'fast',
-        fastNode: true,
-        fastKind: 'proxy',
-      });
-    }
-  }
-  return nodes;
-}
-
-// 调试视图：看看这个 isolate 记住了哪些高质 IP、带宽多少
-function handleHighSpeedStatus() {
-  const rows = Array.from(hsGood.values())
-    .sort((a, b) => (b.mbps || 0) - (a.mbps || 0) || a.rtt - b.rtt)
-    .map((record) => ({
-      kind: record.kind,
-      addr: record.addr,
-      country: record.country,
-      city: record.city,
-      isp: record.isp,
-      as: record.as,
-      risk: record.risk,
-      rtt: record.rtt,
-      mbps: record.mbps,
-      ageSec: Math.round((Date.now() - record.at) / 1000),
-    }));
-  return new Response(JSON.stringify({
-    pageVersion: PAGE_VERSION,
-    group: HS_NAME,
-    tlsProbe: hsTlsBroken ? 'startTls 不可用，只按延迟+风险判定' : '可用',
-    lastError: hsLastError,
-    good: rows.length,
-    dead: hsDead.size,
-    rows,
-  }, null, 2), {
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-  });
 }
 
 // 带独立超时的抓取（订阅生成路径上用，绝不能等满 SOURCE_TIMEOUT）
@@ -1936,7 +1517,7 @@ async function connectViaSocks5Proxy(proxy, targetHost, targetPort, payload, tim
 }
 
 // 并发竞争：谁先 CONNECT 成功就用谁；成功的那个记住，下次先试
-// 只从「指定地址」里抢（纯净中转用：这些地址的出口已经验过是 IPv4）
+// 只从「指定地址」里抢（优质稳定中转用：这些地址的出口已经验过是 IPv4）
 async function raceProxiesFrom(addrs, targetHost, targetPort, payload, ms = 3000) {
   const list = (addrs || []).filter((addr) => typeof addr === 'string' && /^[^\s|,:]+:\d{1,5}$/.test(addr));
   if (!list.length) return null;
@@ -2188,13 +1769,13 @@ function isNotRelayFault(message) {
 }
 // 越小越好：冷却中的排最后（越早恢复越靠前），没测过的中性，测得快且新鲜的排最前
 // 出口质量：中转机「能握手」不代表「能传数据」——实测一半以上是握手秒回、传几 KB 就断。
-// 这里用自己 Worker 的 /hs/speed 传 256KB 实测量，带宽和首字节都记下来。
+// 这里经该 IP 起 TLS 打 speed.cloudflare.com 的 256KB 文件，带宽和首字节都记下来。
 const relayQuality = new Map();
 const RELAY_QUALITY_TTL = 2 * 60 * 60 * 1000;
 const RELAY_SPEED_BYTES = 262144;
 const RELAY_SPEED_MIN = 0.15;   // Mbps，低于这个就算「传不动」
 let relayQualityBusy = false;
-let runtimeHost = '';   // 当前请求的域名，出口测速要拿它当 SNI 回来打自己的 /hs/speed
+let runtimeHost = '';   // 当前请求的域名（日志/诊断用）
 
 async function probeRelayQuality(item, hostName, ms = 7000) {
   if (!item || !item.ip) return null;
@@ -2245,7 +1826,7 @@ async function probeRelayQuality(item, hostName, ms = 7000) {
     const mbps = body > 0 ? (body * 8) / 1e6 / (span / 1000) : 0;
     const record = { mbps: Math.round(mbps * 100) / 100, rtt: tlsAt - started, at: Date.now(), got: bytes, trace, head: head.replace(/[\r\n]/g, '|') };
     relayQuality.set(item.key, record);
-    if (mbps < RELAY_SPEED_MIN) markRelayFail(item.key);
+    if (mbps < RELAY_SPEED_MIN) noteRelayFail(item.key);
     else noteRelayOk(item.key, record.rtt);
     return record;
   } catch (error) {
@@ -2554,7 +2135,7 @@ async function openTargetInner(address, port, payload, forceRelay = false, pinne
     throw new Error('直连失败');
   }
   if (relayRegion === 'PURE') {
-    // 纯净中转：候选是中转机（出口就是机器自己的 IPv4）。不钉 IP，运行时抢，赢家记住，死了冷却换下一批
+    // 优质稳定中转：候选是中转机（出口就是机器自己的 IPv4）。不钉 IP，运行时抢，赢家记住，死了冷却换下一批
     const cached = pureAddrs();
     let order = cached.map((addr) => {
       const hit = (pureCache.list || []).find((item) => item.addr === addr) || {};
@@ -2578,7 +2159,7 @@ async function openTargetInner(address, port, payload, forceRelay = false, pinne
       for (const item of batch) pureDead.set(item.key, Date.now());
     }
     kickPureProbe();
-    throw new Error('纯净中转暂无可用出口');
+    throw new Error('优质稳定中转暂无可用出口');
   }
   if (relayRegion) {
     const matched = await tryRelayRegion(relayRegion);
@@ -3719,7 +3300,7 @@ async function buildPremiumNodes(hostName, sharedPool = null, waitMs = 0) {
   return nodes;
 }
 
-// 纯净中转：只出现在「节点选择」里的一种中转节点（group='pure' 不会被任何自动组选中）
+// 优质稳定中转：只出现在「节点选择」里的一种中转节点（group='pure' 不会被任何自动组选中）
 function pureShuffle(list) {
   const arr = list.slice();
   for (let i = arr.length - 1; i > 0; i -= 1) {
@@ -3810,7 +3391,7 @@ async function buildPureNodes(hostName, ctx = null) {
 }
 function pureNodeOf(item, index, hostName) {
   return {
-    name: '🌍 纯净中转' + (index ? ' ' + (index + 1) : '') + (item.egressLoc ? '·' + item.egressLoc : '') + (item.rtt ? '·' + item.rtt + 'ms' : '') + (item.reliable ? '·✓' : ''),
+    name: '🌍 优质稳定中转' + (index ? ' ' + (index + 1) : '') + (item.egressLoc ? '·' + item.egressLoc : '') + (item.rtt ? '·' + item.rtt + 'ms' : '') + (item.reliable ? '·✓' : ''),
     server: hostName,
     port: 443,
     uuid: userID,
@@ -3818,7 +3399,7 @@ function pureNodeOf(item, index, hostName) {
     // 不钉具体代理：运行时自己挑、自己换（缓存里有记忆），这样单条挂了也不影响这个节点
     path: WS_PATH + '&mode=relay&rg=PURE',
     tls: true,
-    region: '纯净中转',
+    region: '优质稳定中转',
     flag: '🌍',
     country: 'PURE',
     city: item.egressLoc || '',
@@ -3874,18 +3455,13 @@ async function buildContext(request, mode = 'relay', ctx = null) {
     relayNode: false,
   }));
   // 优质代理：只在「自动代理」组里追加，不改动上面 5 个代理-优化的行为
-  // 代理池抓取和「自动高速」的中转探测并行跑：先起探测，池子用 promise 传下去
+  // 代理池抓取先起，池子用 promise 往下传（不阻塞，谁需要谁 await）
   const premiumPromise = fetchPremiumPool().catch(() => null);
   // 生成配置时顺手补测几条中转出口带宽：这是唯一稳定会跑到的时机（热路径不阻塞，丢后台）
   try { await loadRelayList(); kickRelayQuality(hostName, 4); } catch (error) {}
   // 让代理池的抓取不会被响应结束掐断：这次没等到，下次请求就能用上
   if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(premiumPromise);
-  const fastPromise = buildHighSpeedNodes(hostName, premiumPromise, ctx).catch(() => []);
   const proxyPremium = await buildPremiumNodes(hostName, premiumPromise, PREMIUM_WAIT);
-
-  // 自动高速：现场测出站质量（风险 / 延迟 / 带宽），只把过关的中转和代理放进新组
-  let fastNodes = await fastPromise;
-  if (!Array.isArray(fastNodes)) fastNodes = [];
 
   // 中转池里真实存在 443 IPv4 机器的地区：只有这些才生成「中转-地区」节点，
   // 否则节点名写着某个地区、实际连的是别的地区（v1.0.7 的老毛病）
@@ -3933,18 +3509,17 @@ async function buildContext(request, mode = 'relay', ctx = null) {
     });
   }
 
-  // 纯净中转：单独一组，只进「节点选择」
+  // 优质稳定中转：单独一组，只进「节点选择」
   let pureNodes = [];
   try { pureNodes = await buildPureNodes(hostName, ctx); } catch (error) { pureNodes = []; }
 
-  // 纯净中转排最前：它是「无污染出口」的首选，客户端一眼就能选到
-  const nodes = pureNodes.concat(relayOptimized).concat(relayRegionNodes).concat(directOptimized).concat(directRegionNodes).concat(proxyOptimized).concat(proxyPremium).concat(fastNodes);
+  // 优质稳定中转排最前：它是「无污染出口」的首选，客户端一眼就能选到
+  const nodes = pureNodes.concat(relayOptimized).concat(relayRegionNodes).concat(directOptimized).concat(directRegionNodes).concat(proxyOptimized).concat(proxyPremium);
   if (!nodes.length) throw new Error(snapshot.error || '没有可用节点');
 
   return {
     hostName,
     nodes,
-    fastNodes,
     hostNodes: buildHostNodes(hostName),
     visaNodes: buildVisaNodes(hostName),
     relayNodes: relayOptimized.concat(relayRegionNodes),
@@ -4074,7 +3649,6 @@ function yamlGroups(nodes, meta = false) {
   const relayList = pick('relay');
   const directList = pick('direct');
   const proxyList = pick('proxy');
-  const fastList = pick('fast');
   const pureList = pick('pure');
 
   const groups = [];
@@ -4082,10 +3656,9 @@ function yamlGroups(nodes, meta = false) {
   if (relayList.length) menu.push('    - 🔀 自动中转');
   if (directList.length) menu.push('    - 🚀 自动直连');
   if (proxyList.length) menu.push('    - 🛡 自动代理');
-  if (fastList.length) menu.push('    - ' + HS_NAME);
   menu.push('    - ' + (meta ? '不使用节点' : 'DIRECT'));
 
-  // 纯净中转排最前面（单节点，不带分组），其余节点按原顺序跟在分组后面
+  // 优质稳定中转排最前面（单节点，不带分组），其余节点按原顺序跟在分组后面
   const pureEntries = pureList.map((node) => '    - ' + quoteYaml(node.name));
   const restEntries = nodes.filter((node) => node.group !== 'pure').map((node) => '    - ' + quoteYaml(node.name));
 
@@ -4102,10 +3675,6 @@ function yamlGroups(nodes, meta = false) {
     const block = build(name, list);
     if (block) groups.push(block);
   }
-
-  // 自动高速：排在自动代理后面；只有测过关的才进来，一条都没有就不出这个组
-  const fastBlock = build(HS_NAME, fastList);
-  if (fastBlock) groups.push(fastBlock);
 
   return 'proxy-groups:\n' + groups.join('\n');
 }
