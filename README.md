@@ -8,7 +8,7 @@
 
 [![Release](https://img.shields.io/github/v/release/LhyCloud/Cloudflare-Free-Proxy?style=flat-square&label=release)](https://github.com/LhyCloud/Cloudflare-Free-Proxy/releases/latest) [![Downloads](https://img.shields.io/github/downloads/LhyCloud/Cloudflare-Free-Proxy/total?style=flat-square&logo=github)](https://github.com/LhyCloud/Cloudflare-Free-Proxy/releases)
 
-[![Single file](https://img.shields.io/badge/single%20file-_worker.js-F6821F?style=flat-square)](_worker.js) [![Protocol](https://img.shields.io/badge/protocol-Trojan%20%2B%20VLESS-2f6feb?style=flat-square)](#订阅与分组) [![Runtime](https://img.shields.io/badge/runtime-Cloudflare%20Workers-FAAF40?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![Single file](https://img.shields.io/badge/single%20file-_worker.js-F6821F?style=flat-square)](_worker.js) [![Protocol](https://img.shields.io/badge/protocol-Trojan%20%2B%20VLESS-2f6feb?style=flat-square)](#订阅与分组) [![Runtime](https://img.shields.io/badge/runtime-Cloudflare%20Workers-FAAF40?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![Runtime](https://img.shields.io/badge/runtime-Cloudflare%20Pages-FAAF40?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 
 [功能](#功能) · [部署](#部署) · [订阅与分组](#订阅与分组) · [客户端用法](#客户端用法) · [节点风险](#节点风险与应对) · [下载页](#下载页) · [常见问题](#常见问题) · [配置项](#配置项) · [版本记录](#版本记录) · [目录](#目录) · [数据源](#数据源)
 
